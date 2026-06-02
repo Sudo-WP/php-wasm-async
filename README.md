@@ -5,10 +5,11 @@ await a Promise, suspend, and resume with the result — inside serverless edge
 runtimes like Cloudflare Workers / workerd.
 
 > **Status: experimental / pre-production.** This is active R&D into an
-> unproven capability. Kickoff and design are complete; the build has not yet
-> run. Approaches, APIs, and results may change, and negative results are
-> documented honestly alongside what works. See
-> [`docs/HANDOFF.md`](docs/HANDOFF.md) for current state.
+> unproven capability. The unmodified PHP 8.0.30 WebAssembly baseline now
+> builds from source and runs synchronously in Node (Session 1); the async
+> suspend/resume primitive itself is not yet proven. Approaches, APIs, and
+> results may change, and negative results are documented honestly alongside
+> what works. See [`docs/HANDOFF.md`](docs/HANDOFF.md) for current state.
 
 ## The problem
 

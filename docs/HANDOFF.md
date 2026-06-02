@@ -25,18 +25,33 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Kickoff complete. No build has run yet.
+**Phase:** Session 1 complete (2026-06-03). The unmodified PHP **8.0.30**
+WebAssembly baseline is **built from source and runs synchronously in Node V8**
+(`<?php echo "hello\n";` → `hello`, exit 0; `PHP_VERSION` → `8.0.30`). Sizes
+and timings recorded in `RESULTS.md`; link-time license audit started in
+`NOTICE`.
+
+Build artifacts (not committed; `*.wasm` gitignored) live in the scratch
+checkout: `~/scratch/php-wasm-upstream/packages/php-wasm/php8.0-node.mjs.wasm`
+(+ `php8.0-node.mjs` glue). The pipeline checkout is kept outside this repo.
 
 **Decided** (see `DECISIONS.md` for full reasoning):
 - License: **Apache-2.0**, clean-derivation path.
 - Lineage: derive from the **Apache-2.0** ancestor pipeline, not the
   GPL Playground packages.
 - Suspension mechanism: **Asyncify first**, JSPI as a later optimization.
-- Toolchain: **Emscripten 4.0.19**, **PHP 8.0.30**.
+  (Asyncify is already on in the baseline by upstream default.)
+- Toolchain: **PHP 8.0.30**; Emscripten = **seanmorris fork 3.1.68
+  (`sm-updates`)**, not stock 4.0.19 — corrected in **ADR-0007**, which
+  supersedes ADR-0004's Emscripten pin.
+- Baseline config: full extension set (`.circleci/.env_8.0.ci`), chosen so
+  Session 2 diffs against a canonical, comparable build.
 - PoC scope and success criteria: defined (`DECISIONS.md` ADR-0005).
 - Kill criterion: defined (`DECISIONS.md` ADR-0006).
 
-**Not yet started:** the baseline build (Session 1).
+**Build prerequisite (learned in Session 1):** run `npm install` in the
+pipeline checkout before `make`, or the build recurses infinitely. See
+`RESULTS.md` negative result #1 and `BUILD.md`.
 
 ---
 
@@ -73,8 +88,13 @@ Carry these forward as explicit risks rather than assumptions:
    in the target serverless runtime in third-party projects, but it is
    compatibility-date gated and not documented as a first-class stable
    feature. Confirm empirically before committing to it for production.
-2. **Link-time license audit.** Confirm no GPL/LGPL component enters the
-   static link before any binary is published. See `DECISIONS.md` ADR-0001.
+2. **Link-time license audit — OPEN FINDING.** The Session 1 build statically
+   links **GNU libiconv 1.17 (LGPL-2.1-or-later)** — an LGPL component in the
+   static link, exactly the case ADR-0001 flagged. `readline` (GPL) is
+   correctly excluded. This must be resolved before publishing any binary:
+   meet the LGPL obligations for a static artifact, or drop/replace iconv.
+   OpenSSL here is 1.1.1x (legacy dual OpenSSL/SSLeay license). See `NOTICE`
+   and `RESULTS.md` negative result #3.
 3. **Exhaustive suspendable-imports list.** The most likely time-sink. Adding
    one async import can surface a chain of functions that must also be made
    suspendable, each discovered only by crashing and reading the stack trace.
@@ -87,7 +107,13 @@ Carry these forward as explicit risks rather than assumptions:
 
 ## Next action
 
-**Draft the Session 1 build plan** (baseline build): reproduce an unmodified
-PHP 8.0.30 WebAssembly binary from the permissive pipeline and confirm it
-runs in Node. Implementation runs in the separate coding environment;
-benchmark analysis and build planning happen in the design chat.
+**Session 2 — add the async import and recompile (Asyncify).** Add
+`fp_async_call` to the suspendable-imports list, expose it to PHP, provide the
+host implementation, and recompile from the same baseline config so the binary
+diffs cleanly against Session 1. Expect to iterate on the suspendable-functions
+list (a missing function surfaces as a runtime crash naming the omission).
+Goal: the binary builds and PHP can call the function. Reuse the validated
+build flow in `BUILD.md` (remember the `npm install` prerequisite).
+
+Carried-over cleanup (not blocking Session 2, but before any binary is
+published): resolve the **libiconv LGPL** link-audit finding (risk #2 above).

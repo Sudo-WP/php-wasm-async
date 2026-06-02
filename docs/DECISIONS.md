@@ -10,6 +10,41 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0007 — Emscripten is the seanmorris fork (3.1.68), not stock 4.0.19
+**Date:** 2026-06-03 · **Status:** Accepted · **Supersedes:** ADR-0004 (the
+Emscripten pin and its rationale; ADR-0004's PHP 8.0.30 decision stands)
+
+**Decision.** Build with the Emscripten that the reference `seanmorris/php-wasm`
+pipeline actually ships and validates: the **seanmorris/emscripten fork, branch
+`sm-updates`** (effective `emcc 3.1.68-git`, commit d8c09a1, 2024-10-08), which
+its Dockerfile clones over an `emscripten/emsdk:3.1.67` base, replacing stock
+Emscripten entirely. We do **not** force stock Emscripten 4.0.19.
+
+**Why this supersedes ADR-0004.** ADR-0004 pinned 4.0.19 and justified it as
+"matching the version the upstream reference pipeline validates its PHP builds
+against." Session 1 investigation showed that premise is factually wrong: the
+pipeline does not use 4.0.19 (or any stock Emscripten) — it uses the fork. The
+fork exists for Cloudflare-Workers compatibility (the Dockerfile documents a
+bisection: emsdk 3.1.43–3.1.44 work on Cloudflare, 3.1.45+ regressed, and
+`sm-updates` restores it). Forcing stock 4.0.19 would (a) diverge from the
+lineage ADR-0003 tells us to derive from, (b) drop the fork's
+Cloudflare-targeted fixes — the very runtime we are aiming at — and (c)
+introduce an unvalidated toolchain into an already fragile build, which is the
+exact risk ADR-0004 set out to avoid. The JSPI rationale is unaffected: 3.1.68
+satisfies JSPI ≥ 3.1.61.
+
+**Consequences.** BUILD.md records the fork as the pinned toolchain. The host
+`~/emsdk` 4.0.19 is incidental (handy for ad-hoc `emcc` checks); the build runs
+entirely inside the Docker builder image. If a future need to move off the fork
+arises (e.g. JSPI optimization in Session 5), that is a new decision to record
+here, with its own Cloudflare-compatibility verification.
+
+**Alternatives considered.** Force stock 4.0.19 (rejected: see (a)–(c) above).
+Rebase the fork's changes onto a 4.0.19 base (rejected for the baseline:
+high effort, fragile, no payoff for an unmodified-PHP baseline).
+
+---
+
 ## ADR-0006 — Kill criterion for the proof-of-concept
 **Date:** 2026-06-02 · **Status:** Accepted
 
@@ -69,7 +104,8 @@ resume with the value — from every downstream concern.
 ---
 
 ## ADR-0004 — Toolchain pinning
-**Date:** 2026-06-02 · **Status:** Accepted
+**Date:** 2026-06-02 · **Status:** Partially superseded by ADR-0007 (the
+Emscripten pin/rationale; the PHP 8.0.30 baseline decision still stands)
 
 **Decision.** Pin the build toolchain:
 
