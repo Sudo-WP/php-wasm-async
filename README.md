@@ -1,28 +1,42 @@
 # php-wasm-async
 
-A rebuild of the PHP-to-WebAssembly runtime that lets PHP call a
-host-provided **asynchronous** function, suspend, and resume with the
-resolved value — running inside serverless WebAssembly environments
-(initial target: Cloudflare Workers / workerd).
+Run **real PHP in WebAssembly** that can call **asynchronous host functions** —
+await a Promise, suspend, and resume with the result — inside serverless edge
+runtimes like Cloudflare Workers / workerd.
 
-> **Status: early.** Kickoff and design are complete; the build has not yet
-> run. See [`docs/HANDOFF.md`](docs/HANDOFF.md) for current state.
+> **Status: experimental / pre-production.** This is active R&D into an
+> unproven capability. Kickoff and design are complete; the build has not yet
+> run. Approaches, APIs, and results may change, and negative results are
+> documented honestly alongside what works. See
+> [`docs/HANDOFF.md`](docs/HANDOFF.md) for current state.
 
-## Why
+## The problem
 
-PHP executes synchronously. Many edge data stores are asynchronous only, so
-today data must be loaded eagerly before PHP runs — which cannot serve
-queries whose terms are not known until PHP executes. This runtime provides
-a single generic primitive that removes that limit:
+PHP is synchronous. Edge data stores — Cloudflare D1, KV, R2 — are async-only.
+That mismatch means PHP running in a Worker can't `await` a database query
+mid-execution. The usual workaround is to eagerly load all data before PHP
+runs, which breaks down the moment a query's terms aren't known until runtime
+(dynamic apps, real WordPress, WooCommerce).
+
+## What this provides
+
+A rebuilt PHP-WASM runtime where PHP can call a host-provided async function,
+yield, and continue once the Promise resolves — making live, on-demand edge
+database access from PHP possible for the first time.
+
+The primitive is deliberately generic — a general "await a host Promise"
+facility:
 
 > PHP calls a host function, the host returns a Promise, PHP suspends until
 > it resolves, and PHP resumes with the resolved value as the return value
 > of the call.
 
-The primitive is deliberately generic — a general "await a host Promise"
-facility. Specific data stores, key-value stores, object stores, and network
-calls are **consumers** layered on top, not assumptions baked into the
-interface.
+Specific data stores, key-value stores, object stores, and network calls are
+**consumers** layered on top, not assumptions baked into the interface — D1 is
+simply the first consumer.
+
+Built on Emscripten + PHP source, based on the WordPress Playground php-wasm
+build. Runtime-agnostic by design.
 
 ## Documentation
 
