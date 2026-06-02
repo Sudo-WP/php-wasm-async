@@ -1,0 +1,20 @@
+# Build artifacts
+*.wasm
+*.o
+*.a
+build/
+dist/
+node_modules/
+
+# Toolchain / local
+emsdk/
+downloads/
+
+# Secrets & local config
+.dev.vars
+.wrangler/
+*.log
+
+# OS / editor cruft
+*:Zone.Identifier
+.DS_Store

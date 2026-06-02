@@ -1,0 +1,37 @@
+php-wasm-async
+Copyright 2026 the php-wasm-async authors
+
+This product includes software produced by recompiling the PHP interpreter
+to WebAssembly, together with a hand-written host loader.
+
+================================================================================
+Binary attributions  (STARTER — finalize from the Session 1 build)
+================================================================================
+
+The compiled php.wasm binary is a derivative work of:
+
+- PHP, under the PHP License v3.01 — https://www.php.net/license/3_01.txt
+  This product is not endorsed by the PHP Group. In accordance with the PHP
+  License naming restriction, "PHP" is not used in this product's name.
+
+- The Zend Engine, under the Zend Engine License.
+
+- Statically-linked libraries, each under its own permissive license
+  (e.g. public-domain, MIT, BSD, Apache-2.0). The exact set is finalized
+  once the Session 1 build determines what is linked; this section will then
+  list each library with its license and required notice text. GPL/LGPL
+  components are excluded from the link (see docs/DECISIONS.md ADR-0001 and
+  ADR-0003, and the link-time license audit risk in docs/HANDOFF.md).
+
+================================================================================
+Prior-art acknowledgment  (courtesy)
+================================================================================
+
+The build approach draws on prior PHP-to-WebAssembly work:
+
+- seanmorris/php-wasm (Apache-2.0) and its PIB origin — the permissive
+  lineage this project's build scripts are derived from.
+
+- WordPress Playground's PHP-WASM build pipeline — referenced for factual
+  information only (e.g. which functions must be made suspendable); no code
+  was copied. See docs/DECISIONS.md ADR-0003.
