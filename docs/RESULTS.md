@@ -89,6 +89,49 @@ still boots), which is why it exceeds the ~20 ms prior figure; the prior
 exec is for `echo "hello"` — it touches no extension; the 2–31 ms prior range
 was surely heavier scripts. These are baselines to refine, not pass/fail.
 
+## Session 2 — `fp_async_call` import added (2026-06-03)
+
+**What changed.** Exactly one new host import, `fp_async_call`, added to the
+Session 1 baseline (same `.env_8.0.ci` config, same toolchain). Delta committed
+as `patches/session2-fp_async_call.patch`. No iconv/library/config changes.
+
+**Builds and PHP can call it (the Session 2 goal).** Evidence in Node V8:
+
+```
+$ node call.mjs
+function_exists("fp_async_call") -> exists
+<?php echo "before:\n"; $r = fp_async_call(41); echo "after: $r\n";
+  -> stdout "before:\nafter: 42\n", exit 0, stderr ""
+RESULT: PASS
+$ node hello.mjs   # regression: baseline still runs
+  -> "hello", PHP_VERSION 8.0.30, PASS
+```
+
+The host implementation is synchronous this session (`payload + 1`); genuine
+Promise suspension is Session 3.
+
+**The "+1 import" cost** (Asyncify, vs the Session 1 baseline):
+
+| Artifact                 | Session 1     | Session 2     | Delta     |
+|--------------------------|---------------|---------------|-----------|
+| `…node.mjs.wasm` raw     | 12,181,923 B  | 12,183,180 B  | **+1,257 B** |
+| `…node.mjs.wasm` gzip    | 2,979,648 B   | 2,979,758 B   | **+110 B** |
+| `…node.mjs` glue raw     | 315,711 B     | 315,807 B     | +96 B     |
+
+The cost of the import itself is negligible because Asyncify instrumentation
+was already fully present in the Session 1 baseline (`-sASYNCIFY=1`,
+whole-program). The Asyncify *size tax* is not new in Session 2 — it was
+already paid in Session 1.
+
+**Suspendable-functions list: a single entry, no iteration.** The most
+important result to surface. Because the pipeline instruments all functions
+(no `ASYNCIFY_ONLY` allowlist — confirmed by grep), the whole call stack is
+already suspendable, and the import built and ran on the **first** attempt.
+There were **no** suspend-related crashes to resolve, so the list is simply
+`fp_async_call`. This materially de-risks Session 3 and relaxes the effort
+side of the ADR-0006 kill criterion: the feared "imports-list balloon" does
+not occur on this pipeline. See ADR-0008 for the trade-off and JSPI caveat.
+
 ## Proof-of-concept result
 
 *Pending Session 3.* To be recorded:

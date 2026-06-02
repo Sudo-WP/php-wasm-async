@@ -123,17 +123,73 @@ The full extension set (`.env_8.0.ci`) links statically into one binary — no
 `.so` files are emitted. The link-time license audit of that set is in
 `NOTICE`; it surfaced one open issue (libiconv, LGPL-2.1) — see `RESULTS.md`.
 
+### Session 2 — add the `fp_async_call` import (validated 2026-06-03)
+
+Adds **exactly one** new host import to the Session 1 baseline. The complete,
+reproducible delta is committed as `patches/session2-fp_async_call.patch`
+(against the pipeline checkout); apply it with `git apply` from
+`~/scratch/php-wasm-upstream/` and rebuild. The three changes are:
+
+1. **Host implementation** — `source/library_fp_async.js` (our Apache-2.0
+   code) registers the `fp_async_call` WebAssembly import via
+   `mergeInto(LibraryManager.library, …)`. Session 2 body is synchronous
+   (`payload + 1`); Session 3 swaps it for a deferred Promise.
+2. **PHP exposure** — `source/pib/pib.c` (the already-wired `pib` extension)
+   gains `extern int fp_async_call(int)`, a `PHP_FUNCTION(fp_async_call)`
+   wrapper, and a `zend_function_entry` table (the module previously
+   registered no userspace functions). PHP can now call `fp_async_call($x)`.
+3. **Link flags** — one `EXTRA_FLAGS` line in the `Makefile` adds
+   `--js-library /src/source/library_fp_async.js` and
+   `-s ASYNCIFY_IMPORTS=fp_async_call`.
+
+Rebuild with the **identical** Session 1 command — editing `pib.c` forces the
+re-copy into `php-src/ext/pib`, a reconfigure, a recompile, and a relink that
+picks up the new flags:
+
+```bash
+cd ~/scratch/php-wasm-upstream
+ls -d node_modules >/dev/null || PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install
+git apply ~/php-wasm-async/patches/session2-fp_async_call.patch   # if pristine
+make PHP_VERSION=8.0 ENV_FILE=.circleci/.env_8.0.ci node-mjs
+```
+
+Verify in Node: `function_exists("fp_async_call")` is true and
+`fp_async_call(41)` returns `42` (`before:\nafter: 42\n`), exit 0.
+
+#### Suspendable-functions list — **one entry, no iteration needed**
+
+The most important Session 2 finding. The seanmorris pipeline builds with
+**whole-program Asyncify** (`-sASYNCIFY=1` and **no `ASYNCIFY_ONLY`
+allowlist** anywhere — confirmed by grep across the Makefile, `source/`, and
+the env file). Every function is already instrumented to unwind/rewind, so the
+entire `pib_run → zend_eval_string → … → fp_async_call` stack is suspendable
+out of the box. The full suspendable-imports list is therefore just:
+
+```
+fp_async_call          # the one import we added (ASYNCIFY_IMPORTS)
+```
+
+No "add a function, rebuild, read the next crash" iteration occurred — adding
+the import built and ran on the first attempt. This is the opposite of the
+WordPress Playground experience, which curates an `ASYNCIFY_ONLY` allowlist
+(smaller binary, but each new suspend point can surface a chain of functions
+that must be added). See ADR-0008 for the trade-off and its forward
+implications (JSPI port).
+
 ### Later sessions (outline, not yet validated)
 
-1. Add the `fp_async_call` import; recompile under Asyncify; iteratively
-   extend the suspendable-functions list until the binary runs without
-   suspend-related crashes. (Session 2)
+1. Make `fp_async_call` actually suspend on an unresolved Promise
+   (`Asyncify.handleAsync`) and make the run path await it (`pib_run` is
+   currently called via a synchronous `ccall`). (Session 3)
 2. Wire the binary into the target-runtime loader. (Session 4)
 
 ## Known fragile steps
 
-- **Exhaustive suspendable-imports list.** Expect iteration: a missing
-  function appears as a runtime crash whose stack trace names the omission.
+- **Exhaustive suspendable-imports list.** *Not a problem on this pipeline*
+  (Session 2 finding): it uses whole-program Asyncify with no `ASYNCIFY_ONLY`
+  allowlist, so all functions are already suspendable and adding an import
+  needs no iteration. This step only bites if a curated allowlist is later
+  introduced (e.g. to shrink the binary), or under JSPI. See ADR-0008.
 - **First container build is long** and produces large intermediate layers.
 - **JSPI frame-suspension limits.** Some functions cannot be suspended via
   JSPI and must be handled differently; relevant only when porting to JSPI.

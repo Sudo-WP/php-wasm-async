@@ -25,15 +25,28 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Session 1 complete (2026-06-03). The unmodified PHP **8.0.30**
-WebAssembly baseline is **built from source and runs synchronously in Node V8**
-(`<?php echo "hello\n";` → `hello`, exit 0; `PHP_VERSION` → `8.0.30`). Sizes
-and timings recorded in `RESULTS.md`; link-time license audit started in
-`NOTICE`.
+**Phase:** Session 2 complete (2026-06-03). The PHP **8.0.30** WebAssembly
+binary now exposes **exactly one new host import, `fp_async_call`**, and PHP
+can call it: `fp_async_call(41)` → `42` (`before:\nafter: 42\n`), exit 0, with
+the Session 1 baseline still running unchanged. The host implementation is
+synchronous this session; real Promise suspension is Session 3.
+
+**Key Session 2 finding:** the pipeline uses **whole-program Asyncify** (no
+`ASYNCIFY_ONLY` allowlist), so the entire call stack is already suspendable —
+the import built and ran on the first attempt with **no imports-list
+iteration**. The suspendable-imports list is a single entry (`fp_async_call`).
+This de-risks Session 3 and the kill criterion. Recorded as ADR-0008; size
+delta is +1,257 B raw / +110 B gzip (see `RESULTS.md`).
+
+(Session 1, still true: unmodified baseline builds from source and runs
+synchronously in Node V8; sizes/timings in `RESULTS.md`; link audit in
+`NOTICE`.)
 
 Build artifacts (not committed; `*.wasm` gitignored) live in the scratch
 checkout: `~/scratch/php-wasm-upstream/packages/php-wasm/php8.0-node.mjs.wasm`
 (+ `php8.0-node.mjs` glue). The pipeline checkout is kept outside this repo.
+The Session 2 source delta is committed here as
+`patches/session2-fp_async_call.patch`.
 
 **Decided** (see `DECISIONS.md` for full reasoning):
 - License: **Apache-2.0**, clean-derivation path.
@@ -57,14 +70,15 @@ pipeline checkout before `make`, or the build recurses infinitely. See
 
 ## Session sequence
 
-1. **Build environment + reproduce baseline.** Stand up the toolchain, build
-   an *unmodified* PHP 8.0.30 WebAssembly binary from the permissive
+1. **[DONE] Build environment + reproduce baseline.** Stand up the toolchain,
+   build an *unmodified* PHP 8.0.30 WebAssembly binary from the permissive
    pipeline, confirm it runs synchronously in Node. Goal: a clean,
    reproducible baseline that we own. Output documented in `BUILD.md`.
-2. **Add the import and recompile (Asyncify).** Add `fp_async_call` to the
-   suspendable-imports list, expose it to PHP, provide the host
-   implementation, recompile. Resolve the iterative imports-list crashes.
-   Goal: the binary builds and PHP calls the function.
+2. **[DONE] Add the import and recompile (Asyncify).** `fp_async_call` added
+   to ASYNCIFY_IMPORTS, exposed to PHP via the `pib` extension, host impl in
+   `source/library_fp_async.js`, recompiled. No imports-list iteration was
+   needed (whole-program Asyncify — ADR-0008). PHP calls it: `fp_async_call(41)`
+   → `42`. Synchronous host impl; suspension is Session 3.
 3. **Prove suspend/resume in Node V8.** Make the Promise resolve on a later
    tick; confirm `after: 42` with correct ordering. **Decision point** — the
    hard kill criterion applies here.
@@ -88,13 +102,16 @@ Carry these forward as explicit risks rather than assumptions:
    in the target serverless runtime in third-party projects, but it is
    compatibility-date gated and not documented as a first-class stable
    feature. Confirm empirically before committing to it for production.
-2. **Link-time license audit — OPEN FINDING.** The Session 1 build statically
-   links **GNU libiconv 1.17 (LGPL-2.1-or-later)** — an LGPL component in the
-   static link, exactly the case ADR-0001 flagged. `readline` (GPL) is
-   correctly excluded. This must be resolved before publishing any binary:
-   meet the LGPL obligations for a static artifact, or drop/replace iconv.
-   OpenSSL here is 1.1.1x (legacy dual OpenSSL/SSLeay license). See `NOTICE`
-   and `RESULTS.md` negative result #3.
+2. **Link-time license audit — OPEN FINDING, MUST RESOLVE BEFORE SESSION 3 /
+   BEFORE ANY PUBLISH.** The build statically links **GNU libiconv 1.17
+   (LGPL-2.1-or-later)** — an LGPL component in the static link, exactly the
+   case ADR-0001 flagged. `readline` (GPL) is correctly excluded. Left
+   untouched in Session 2 on purpose (resolving it changes the binary and
+   would have contaminated the clean "+1 import" diff). It must be resolved
+   before Session 3 / before publishing any binary: meet the LGPL obligations
+   for a static artifact, or drop/replace iconv. OpenSSL here is 1.1.1x
+   (legacy dual OpenSSL/SSLeay license). See `NOTICE` and `RESULTS.md`
+   negative result #3.
 3. **Exhaustive suspendable-imports list.** The most likely time-sink. Adding
    one async import can surface a chain of functions that must also be made
    suspendable, each discovered only by crashing and reading the stack trace.
@@ -107,13 +124,20 @@ Carry these forward as explicit risks rather than assumptions:
 
 ## Next action
 
-**Session 2 — add the async import and recompile (Asyncify).** Add
-`fp_async_call` to the suspendable-imports list, expose it to PHP, provide the
-host implementation, and recompile from the same baseline config so the binary
-diffs cleanly against Session 1. Expect to iterate on the suspendable-functions
-list (a missing function surfaces as a runtime crash naming the omission).
-Goal: the binary builds and PHP can call the function. Reuse the validated
-build flow in `BUILD.md` (remember the `npm install` prerequisite).
+**Session 3 — prove suspend/resume on an unresolved Promise (the hard-kill
+decision point).** Switch `source/library_fp_async.js` from the synchronous
+body to `Asyncify.handleAsync(async () => …)` returning a Promise that resolves
+on a **later** event-loop tick (a zero-delay timer is the strongest proof), and
+make the run path actually await the suspension — `pib_run` is currently
+invoked via a **synchronous** `ccall` in `PhpBase._run()` (no `{async:true}`),
+so that call site must become async-aware or the unwound stack won't be
+resumed. Success: stdout shows `before:` then `after: 42`, where `42` came from
+a Promise unresolved at call time, with host-side logging confirming the
+ordering (control returns to host → event loop turns → Promise resolves → PHP
+resumes). See ADR-0005. The ADR-0006 hard-kill criterion applies at the end of
+Session 3.
 
-Carried-over cleanup (not blocking Session 2, but before any binary is
-published): resolve the **libiconv LGPL** link-audit finding (risk #2 above).
+**Blocker to clear first:** resolve the **libiconv LGPL** link-audit finding
+(open risk #2) — it is marked must-resolve-before-Session-3 / before any
+publish. Decide whether to meet the LGPL static-link obligations or drop/replace
+iconv, since that changes the binary Session 3 will measure.

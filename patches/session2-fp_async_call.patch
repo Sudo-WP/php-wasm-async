@@ -1,0 +1,116 @@
+diff --git a/Makefile b/Makefile
+index a0f28124..06de3a6f 100755
+--- a/Makefile
++++ b/Makefile
+@@ -161,6 +161,13 @@ PHPIZE=third_party/php${PHP_VERSION}-src/scripts/phpize
+ 
+ PRE_JS_FILES+= ${EXTRA_PRE_JS_FILES}
+ 
++# php-wasm-async (Session 2): one new host import, fp_async_call.
++#  - link its host-side implementation as a JS library, and
++#  - list it in ASYNCIFY_IMPORTS so Asyncify treats it as suspend-capable
++#    (Session 3 switches the implementation to a deferred Promise).
++# This is the ONLY intended delta from the Session 1 baseline binary.
++EXTRA_FLAGS+= --js-library /src/source/library_fp_async.js -s ASYNCIFY_IMPORTS=fp_async_call
++
+ TEST_LIST?=
+ 
+ ifeq (${PHP_VERSION},8.5)
+diff --git a/source/library_fp_async.js b/source/library_fp_async.js
+new file mode 100644
+index 00000000..1826bf5f
+--- /dev/null
++++ b/source/library_fp_async.js
+@@ -0,0 +1,30 @@
++// fp_async_call — the php-wasm-async async host-call bridge import.
++//
++// php-wasm-async, Session 2. Registers exactly ONE new host import,
++// fp_async_call, as a WebAssembly import the recompiled PHP runtime can call.
++// It is listed in ASYNCIFY_IMPORTS (see the Makefile EXTRA_FLAGS addition) so
++// Asyncify treats it as *capable* of suspending the PHP call stack.
++//
++// In this session the implementation is synchronous: it returns immediately
++// with no Promise and no stack unwind, which is all Session 2 requires (the
++// binary builds and PHP can call the function). The existing run path calls
++// pib_run via a synchronous ccall, so a non-suspending body is also what keeps
++// that path working unchanged.
++//
++// Session 3 replaces the body below with a Promise resolved on a later
++// event-loop tick via Asyncify.handleAsync(async () => ...), turning this into
++// a genuine suspend/resume point — without changing the import's name or
++// signature, so the "+1 import" wiring proven here is reused as-is.
++//
++// Apache-2.0, the php-wasm-async authors. Original work, not derived from any
++// GPL source; merged into the Emscripten JS library at link time.
++
++mergeInto(LibraryManager.library, {
++	// int fp_async_call(int payload)
++	fp_async_call: function (payload) {
++		// Immediate, synchronous host response. Returns payload + 1, so a PHP
++		// call fp_async_call(41) yields 42 — the proof-of-concept shape from
++		// docs/DESIGN.md.
++		return (payload | 0) + 1;
++	},
++});
+diff --git a/source/pib/pib.c b/source/pib/pib.c
+index ecb82257..e2efe64a 100644
+--- a/source/pib/pib.c
++++ b/source/pib/pib.c
+@@ -38,6 +38,15 @@
+ #define STRINGIFY_INTERNAL(MACRO) #MACRO
+ #define STRINGIFY(MACRO)  STRINGIFY_INTERNAL(MACRO)
+ 
++/*
++ * php-wasm-async (Session 2): the one new host import.
++ * fp_async_call is implemented in JS (source/library_fp_async.js) and linked
++ * as a WebAssembly import; it is listed in ASYNCIFY_IMPORTS so it is capable
++ * of suspending the PHP stack (Session 3). Here it is exposed to PHP userspace
++ * as fp_async_call($payload).
++ */
++extern int fp_async_call(int payload);
++
+ int main(void) { return 0; }
+ 
+ bool started = false;
+@@ -283,6 +292,32 @@ char* EMSCRIPTEN_KEEPALIVE pib_tokenize(char *code)
+ 	ZEND_PARSE_PARAMETERS_END()
+ #endif
+ 
++/*
++ * php-wasm-async (Session 2): expose the fp_async_call host import to PHP
++ * userspace as fp_async_call(int $payload): int. The host implementation
++ * (source/library_fp_async.js) returns the resolved value; in Session 2 that
++ * is synchronous (payload + 1), in Session 3 it becomes a resolved Promise.
++ */
++ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_fp_async_call, 0, 1, IS_LONG, 0)
++	ZEND_ARG_TYPE_INFO(0, payload, IS_LONG, 0)
++ZEND_END_ARG_INFO()
++
++PHP_FUNCTION(fp_async_call)
++{
++	zend_long payload;
++
++	ZEND_PARSE_PARAMETERS_START(1, 1)
++		Z_PARAM_LONG(payload)
++	ZEND_PARSE_PARAMETERS_END();
++
++	RETURN_LONG((zend_long) fp_async_call((int) payload));
++}
++
++static const zend_function_entry pib_functions[] = {
++	PHP_FE(fp_async_call, arginfo_fp_async_call)
++	PHP_FE_END
++};
++
+ PHP_RINIT_FUNCTION(pib)
+ {
+ 	return SUCCESS;
+@@ -306,7 +341,7 @@ PHP_MINFO_FUNCTION(pib)
+ zend_module_entry pib_module_entry = {
+ 	STANDARD_MODULE_HEADER,
+ 	"pib",
+-	NULL,                    /* zend_function_entry */
++	pib_functions,           /* zend_function_entry (php-wasm-async: fp_async_call) */
+ 	PHP_MINIT(pib),          /* PHP_MINIT - Module initialization */
+ 	NULL,                    /* PHP_MSHUTDOWN - Module shutdown */
+ 	PHP_RINIT(pib),          /* PHP_RINIT - Request initialization */

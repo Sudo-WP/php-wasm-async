@@ -10,6 +10,46 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0008 — Rely on whole-program Asyncify; no curated `ASYNCIFY_ONLY` list
+**Date:** 2026-06-03 · **Status:** Accepted
+
+**Decision.** Keep the seanmorris pipeline's default of **whole-program
+Asyncify** (`-sASYNCIFY=1` with **no `ASYNCIFY_ONLY` allowlist**). Adding a new
+suspendable host import therefore requires only listing it in
+`ASYNCIFY_IMPORTS` — no per-function suspendable-list curation. We do **not**
+introduce a curated allowlist for the proof-of-concept.
+
+**Context / evidence (Session 2).** Adding the single import `fp_async_call`
+built and ran on the first attempt, with no "missing suspendable function"
+crashes. Confirmed by grep that no `ASYNCIFY_ONLY` / allowlist exists in the
+Makefile, `source/`, or the env file, so the whole `pib_run → zend_eval_string
+→ … → fp_async_call` stack is already instrumented to unwind/rewind.
+
+**Reasoning.** The PoC's goal is to learn cheaply whether the primitive works.
+Whole-program Asyncify removes the single most-feared time-sink (the
+iterative, crash-driven suspendable-imports list that the WordPress Playground
+build manages via a curated `ASYNCIFY_ONLY` allowlist). The cost is binary
+size and per-call overhead from instrumenting every function — but that cost is
+**already in the Session 1 baseline** and is the same cost the project decided
+to accept under ADR-0002 (Asyncify first). Trading a smaller binary for a
+fragile, iterative build is the wrong trade during a proof.
+
+**Consequences / forward implications.**
+- The ADR-0006 effort estimate improves: the imports-list balloon does not
+  occur on this pipeline.
+- **JSPI caveat (Session 5).** JSPI constrains which frames may suspend and
+  does not have an equivalent "instrument everything" switch; the comfortable
+  Asyncify situation here does **not** transfer automatically to JSPI. The
+  suspendable-frame question must be re-examined when porting to JSPI.
+- If binary size later needs to shrink, revisit with a curated `ASYNCIFY_ONLY`
+  list — a new decision to record here, with the iteration cost it reintroduces.
+
+**Alternatives considered.** Curate an `ASYNCIFY_ONLY` allowlist now (rejected:
+smaller binary but reintroduces the iterative crash-driven list the PoC is
+trying to avoid; premature optimization before the primitive is proven).
+
+---
+
 ## ADR-0007 — Emscripten is the seanmorris fork (3.1.68), not stock 4.0.19
 **Date:** 2026-06-03 · **Status:** Accepted · **Supersedes:** ADR-0004 (the
 Emscripten pin and its rationale; ADR-0004's PHP 8.0.30 decision stands)
