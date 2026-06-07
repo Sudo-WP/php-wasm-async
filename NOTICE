@@ -5,15 +5,14 @@ This product includes software produced by recompiling the PHP interpreter
 to WebAssembly, together with a hand-written host loader.
 
 ================================================================================
-Binary attributions  (Session 1 link-time audit — 2026-06-03)
+Binary attributions  (updated iconv-resolution task — 2026-06-07)
 ================================================================================
 
-This audit reflects the libraries actually statically linked into the
-Session 1 baseline binary (php8.0-node.mjs.wasm), built from the full
-extension configuration (.circleci/.env_8.0.ci). License identifications
-below are the authors' best effort and are subject to the professional
-legal review ADR-0001 calls for; one open issue (libiconv, LGPL) is flagged
-explicitly under "Action required" below.
+This audit reflects the libraries statically linked into the production
+binary (php8.0-node.mjs.wasm), built from the project configuration
+(.circleci/.env_8.0.ci with WITH_ICONV=0). License identifications below
+are the authors' best effort and are subject to the professional legal
+review ADR-0001 calls for.
 
 The compiled php.wasm binary is a derivative work of:
 
@@ -23,7 +22,7 @@ The compiled php.wasm binary is a derivative work of:
 
 - The Zend Engine, under the Zend Engine License.
 
-Statically-linked libraries (as built in Session 1):
+Statically-linked libraries (Session 1 baseline config, WITH_ICONV=0):
 
   Library            Version     License
   -----------------  ----------  --------------------------------------------
@@ -42,21 +41,23 @@ Statically-linked libraries (as built in Session 1):
   libzip             1.x         BSD-3-Clause
   tidy-html5         5.x         HTACG/W3C license (MIT-like)
   OpenSSL            1.1.1x      OpenSSL License + SSLeay License (dual)  [*]
-  GNU libiconv       1.17        LGPL-2.1-or-later   [** ACTION REQUIRED]
 
   [*]  OpenSSL 1.1.1 uses the legacy dual OpenSSL/SSLeay license, NOT the
        Apache-2.0 license that begins with OpenSSL 3.0. Both are permissive.
 
-  [**] libiconv (libiconv.a + libcharset.a) is LGPL-2.1-or-later. This is an
-       LGPL component inside a static link — exactly the case ADR-0001
-       flagged for legal review (LGPL static linking carries relinking and
-       source-availability obligations). It is NOT yet resolved. Options:
-       satisfy the LGPL obligations for a statically-linked artifact, or
-       drop/replace iconv. Tracked in docs/HANDOFF.md and docs/RESULTS.md.
+Charset / iconv: the build uses WITH_ICONV=0. GNU libiconv is NOT present in
+the binary or the distribution. libxml2 uses musl/Emscripten libc's built-in
+iconv; PHP's ext/iconv (iconv(), iconv_strlen(), etc.) is not compiled.
+See docs/DECISIONS.md ADR-0011 for the full analysis, including the
+correction of the Session 1 audit error (libiconv was misidentified as
+statically linked; it was in fact an optional WASM side module).
 
 GPL components are excluded from the link: readline (GPL) is confirmed absent
 from this build (no libreadline in the link set). See docs/DECISIONS.md
 ADR-0001 and ADR-0003.
+
+No LGPL components are present in the statically-linked binary or the
+distributed build artifacts. The ADR-0001 LGPL concern is resolved.
 
 ================================================================================
 Prior-art acknowledgment  (courtesy)

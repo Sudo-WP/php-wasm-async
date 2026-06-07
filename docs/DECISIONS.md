@@ -10,6 +10,48 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0011 — Libiconv LGPL resolution: drop `WITH_ICONV=0`; corrects NOTICE analysis error
+**Date:** 2026-06-07 · **Status:** Accepted · **Resolves:** ADR-0009 deferred obligation
+
+**Decision.** Set `WITH_ICONV=0` in the build configuration (`.circleci/.env_8.0.ci`),
+dropping GNU libiconv and `ext/iconv` entirely from the build. The main wasm binary
+is unchanged by this; only the iconv side-module artifacts are removed.
+
+**Critical finding (corrects NOTICE and RESULTS.md Session 1 analysis).** GNU
+libiconv 1.17 was **never** statically linked into the main wasm binary. The build
+config `WITH_ICONV=1` translates to `WITH_ICONV=dynamic` in `packages/iconv/static.mak`.
+In `dynamic` mode:
+- GNU libiconv is compiled as a WASM side module (`packages/iconv/libiconv.so`), not
+  added to `ARCHIVES` (confirmed: `make -n -p` shows `ARCHIVES =` empty).
+- PHP's ext/iconv is also compiled as a side module (`packages/iconv/php8.0-iconv.so`).
+- PHP's core `php_config.h` has `HAVE_ICONV` and `HAVE_LIBICONV` both `#undef` —
+  zero iconv code is compiled into the main wasm binary.
+- The NOTICE's "Action required" statement ("statically linked libiconv.a + libcharset.a")
+  was an analysis error: it identified the intermediate build artifact (`lib/lib/libiconv.a`,
+  built as a step to produce the side module `.so`) as a direct static link, which it is
+  not. The `ARCHIVES` variable (which controls what is statically linked) is empty.
+
+Despite this correction, GNU libiconv (LGPL) IS present in the full runtime distribution
+as a side-module file. Even with its lighter LGPL dynamic-linking obligations (users can
+replace the `.so`), the cleanest Apache-2.0 outcome is to drop it entirely.
+
+**Why drop rather than keep-and-document.** Setting `WITH_ICONV=0`:
+- Removes GNU libiconv in any form from the build and distribution.
+- Eliminates all LGPL-related obligations — no relinking, no source availability notice.
+- Has zero impact on the main wasm binary (same binary, same session proofs remain valid).
+- Does not affect `ext/mbstring` (uses Oniguruma + PHP's libmbfl, both permissive) or
+  libxml2 (uses musl/Emscripten libc's built-in iconv, not GNU libiconv).
+- `ext/iconv` functions (`iconv()`, `iconv_strlen()`, etc.) become unavailable in PHP,
+  but these are not needed for the generic async host-call bridge this project provides.
+
+**Alternatives considered.**
+- Keep dynamic libiconv and document LGPL obligations: rejected — unnecessary LGPL
+  friction for downstream redistributors when the capability is not needed.
+- Swap to musl iconv only: not needed because musl iconv is already what both libxml2
+  and the Emscripten toolchain use; dropping `WITH_ICONV=0` removes only the GNU extension.
+
+---
+
 ## ADR-0010 — PoC result: Asyncify suspend/resume confirmed in Node V8 (Session 3 PASS)
 **Date:** 2026-06-07 · **Status:** Accepted
 

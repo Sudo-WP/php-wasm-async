@@ -3,10 +3,9 @@
 Benchmarks and findings — what works, what does not, with evidence.
 Negative results are first-class and are recorded here, not glossed over.
 
-> **Status: Session 3 complete (2026-06-07). PROOF-OF-CONCEPT PASSED.** PHP
-> suspended on an unresolved Promise, the event loop turned, and PHP resumed
-> with the resolved value `42`. The ADR-0006 hard-kill criterion is satisfied.
-> Session 4 (port to workerd) is next. Sizes, timings, and ordering proof below.
+> **Status: iconv-resolution task complete (2026-06-07).** Session 3 PoC PASS
+> stands. GNU libiconv dropped (`WITH_ICONV=0`); no LGPL in binary or distribution.
+> Main wasm is byte-identical (12,183,180 B). Session 4 (port to workerd) is next.
 
 ---
 
@@ -269,13 +268,46 @@ already-built `.a` libs survived on disk, so re-running the same `make`
 command resumed incrementally and completed. Lesson: these builds are long;
 expect to re-invoke and rely on the Makefile's incrementality.
 
-### 3. Link-time audit finding: libiconv is LGPL (open)
+### 3. Link-time audit finding: libiconv — RESOLVED (iconv-resolution task, 2026-06-07)
 
-The statically-linked set includes **GNU libiconv 1.17** (`libiconv.a` +
-`libcharset.a`), which is **LGPL-2.1-or-later** — an LGPL component inside a
-static link. This is exactly the risk ADR-0001 flagged for legal review.
-`readline` (GPL) is correctly excluded, but iconv was not anticipated. It is
-**not yet resolved**: either the LGPL static-linking obligations must be met
-for the distributed artifact, or iconv must be dropped/replaced. Recorded in
-NOTICE under "Action required" and carried as an open risk in HANDOFF.
-OpenSSL is 1.1.1x here (legacy dual OpenSSL/SSLeay license, not Apache-2.0).
+**Original (Session 1) finding — since corrected.** The Session 1 audit
+reported GNU libiconv 1.17 (`libiconv.a` + `libcharset.a`) as "statically
+linked." This was an analysis error: the `lib/lib/libiconv.a` seen on disk
+was an intermediate build artifact used to produce a WASM side module
+(`packages/iconv/libiconv.so`), not a static archive linked into the main
+binary. Confirmed by:
+- `make -n -p` with `ENV_FILE=.circleci/.env_8.0.ci`: `ARCHIVES =` (empty).
+- `php_config.h`: `HAVE_ICONV` and `HAVE_LIBICONV` are both `#undef`.
+- `packages/iconv/static.mak`: `WITH_ICONV=1` → `dynamic` mode → adds only
+  `DYNAMIC_LIBS`/`EXTRA_MODULES`, never `ARCHIVES`.
+
+**What was actually the case.** GNU libiconv was built as a WASM side module
+(dynamically loaded via Emscripten's side-module mechanism). The main
+`php8.0-node.mjs.wasm` contained zero libiconv code.
+
+**Resolution.** Set `WITH_ICONV=0` in `.circleci/.env_8.0.ci`. This drops
+GNU libiconv entirely from the build — no side module, no static artifact.
+The main wasm binary is byte-for-byte identical (confirmed: `HAVE_ICONV` was
+already `#undef`; `ARCHIVES` was already empty). PHP's `ext/iconv` functions
+are unavailable; encoding needs are covered by `ext/mbstring` (Oniguruma +
+libmbfl, both permissive). libxml2 uses musl/Emscripten libc's built-in iconv
+throughout. See ADR-0011.
+
+**Post-resolution binary size (confirmed after rebuild, 2026-06-07).**
+
+| Artifact               | Session 3 (WITH_ICONV=1/dynamic) | Post-resolution (WITH_ICONV=0) |
+|------------------------|----------------------------------|--------------------------------|
+| `…node.mjs.wasm` raw   | 12,183,180 B                     | 12,183,180 B (byte-identical)  |
+| `…node.mjs` glue raw   | 316,256 B                        | 316,256 B (unchanged)          |
+
+The glue size is also unchanged — the EXTRA_MODULES list change (removing the
+iconv `.so` references) does not affect the JS glue emitted by Emscripten.
+
+**Re-verification (baseline + Session 3 proof).** Both PASS on the rebuilt binary:
+```
+$ node test-regression.mjs   -> hello/"8.0.30" PASS
+$ node test-session3.mjs     -> before:/after: 42 PASS (ordering confirmed, same latency)
+```
+
+OpenSSL is 1.1.1x (legacy dual OpenSSL/SSLeay license, permissive, not
+Apache-2.0). No LGPL components remain in the binary or distribution.

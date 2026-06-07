@@ -25,11 +25,15 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Session 3 complete (2026-06-07). **PROOF-OF-CONCEPT PASSED.**
-The ADR-0006 hard-kill criterion is satisfied: PHP suspended on an unresolved
-Promise (`setTimeout(0)` macrotask), the event loop turned, and PHP resumed with
-the resolved value `42`. Host-side ordering markers confirm the sequence
-unambiguously. Session 1 baseline still runs unchanged.
+**Phase:** iconv-resolution task complete (2026-06-07). Libiconv LGPL blocker
+(open risk #2) resolved. Session 3 PoC PASS stands unchanged.
+
+**Key finding (corrects Session 1 NOTICE analysis).** GNU libiconv was never
+statically linked — it was an optional WASM side module in `dynamic` mode.
+PHP core had `HAVE_ICONV` and `HAVE_LIBICONV` undefined throughout. Setting
+`WITH_ICONV=0` drops the side-module artifacts entirely; the main wasm binary
+is byte-identical. No LGPL components remain in the binary or distribution.
+See ADR-0011.
 
 **What Session 3 changed (two JS-only deltas, no C recompile):**
 - `source/library_fp_async.js` — upgraded from synchronous stub to
@@ -105,16 +109,11 @@ Carry these forward as explicit risks rather than assumptions:
    in the target serverless runtime in third-party projects, but it is
    compatibility-date gated and not documented as a first-class stable
    feature. Confirm empirically before committing to it for production.
-2. **Link-time license audit — OPEN FINDING, MUST RESOLVE BEFORE SESSION 4 /
-   BEFORE ANY PUBLISH OR DEPLOY (deferred by ADR-0009).** The build statically
-   links **GNU libiconv 1.17 (LGPL-2.1-or-later)** — an LGPL component in the
-   static link, exactly the case ADR-0001 flagged. `readline` (GPL) is correctly
-   excluded. Left untouched in Sessions 2 and 3 on purpose (resolving it changes
-   the binary and would contaminate the clean diffs; the async mechanism is
-   orthogonal to iconv — see ADR-0009). It must be resolved before Session 4 /
-   before publishing any binary: meet the LGPL obligations for a static artifact,
-   or drop/replace iconv. OpenSSL here is 1.1.1x (legacy dual OpenSSL/SSLeay
-   license). See `NOTICE` and `RESULTS.md` negative result #3.
+2. **Link-time license audit — RESOLVED (ADR-0011, 2026-06-07).** GNU libiconv
+   was an optional WASM side module (not statically linked — the Session 1 NOTICE
+   analysis was incorrect). Dropped via `WITH_ICONV=0`; no LGPL component remains
+   in the binary or distribution. OpenSSL 1.1.1x is permissive (dual OpenSSL/SSLeay
+   license). See `NOTICE` and `RESULTS.md` negative result #3 (corrected).
 3. **Exhaustive suspendable-imports list.** The most likely time-sink. Adding
    one async import can surface a chain of functions that must also be made
    suspendable, each discovered only by crashing and reading the stack trace.
@@ -127,13 +126,10 @@ Carry these forward as explicit risks rather than assumptions:
 
 ## Next action
 
-**Immediate pre-Session-4 obligation (blocker):** resolve the **libiconv LGPL**
-link-audit finding (open risk #2, deferred by ADR-0009). Decide whether to meet
-the LGPL static-link obligations for the distributed binary or drop/replace iconv
-before Session 4 begins. This changes the binary; resolve it first so Session 4
-measures the clean binary.
+**Resolved blocker:** libiconv LGPL (open risk #2) was resolved by dropping iconv
+(`WITH_ICONV=0`). No LGPL component in the binary or distribution. ADR-0011.
 
-**Session 4 — port the PoC into workerd.** Wire the Session 3 binary into the
+**Next: Session 4 — port the PoC into workerd.** Wire the Session 3 binary into the
 Cloudflare-style loader, run under workerd locally, confirm the same
 suspend/resume ordering (stdout `before:\nafter: 42\n`) with output delivered via
 the host stdout callback. The ADR-0006 soft-kill criterion applies here: if

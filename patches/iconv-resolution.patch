@@ -1,0 +1,13 @@
+diff --git a/.circleci/.env_8.0.ci b/.circleci/.env_8.0.ci
+index 81de678b..6869637d 100644
+--- a/.circleci/.env_8.0.ci
++++ b/.circleci/.env_8.0.ci
+@@ -20,7 +20,7 @@ WITH_XML=1
+ WITH_SIMPLEXML=1
+ 
+ WITH_LIBZIP=1
+-WITH_ICONV=1
++WITH_ICONV=0
+ WITH_SQLITE=1
+ 
+ WITH_EXIF=1

@@ -24,11 +24,20 @@ How to reproduce the runtime build.
 
 Pin Emscripten explicitly; do not float to the latest toolchain.
 
-## Statically-linked libraries
+## Statically-linked libraries and iconv configuration
 
 The build links a set of libraries that are individually permissively
 licensed (public-domain, MIT, BSD, Apache-2.0). **Exclude `readline`** (GPL)
 and any GPL-licensed extension — see `DECISIONS.md` ADR-0001 and ADR-0003.
+
+**iconv: build with `WITH_ICONV=0`.** The upstream env file ships with
+`WITH_ICONV=1` (→ `dynamic`: GNU libiconv as a WASM side module). For this
+project, `patches/iconv-resolution.patch` changes it to `WITH_ICONV=0`,
+which drops `ext/iconv` and GNU libiconv entirely. PHP core was already
+compiled with `HAVE_ICONV` undefined (iconv was never in the main wasm); the
+only change is that the side-module artifacts (`libiconv.so`,
+`php8.0-iconv.so`) are no longer built. Encoding needs are covered by
+`ext/mbstring` (Oniguruma + libmbfl, permissive). See ADR-0011.
 
 ## Environment prep checklist
 
@@ -225,6 +234,27 @@ glue). Only the JS glue is re-emitted. Verify:
 node test-session3.mjs    # before:/after: 42 + ordering markers — PASS
 node test-regression.mjs  # hello/8.0.30 — PASS
 ```
+
+### iconv-resolution task — drop GNU libiconv (2026-06-07)
+
+Applies `patches/iconv-resolution.patch` to set `WITH_ICONV=0` in
+`.circleci/.env_8.0.ci`. This drops GNU libiconv (LGPL) from the build
+entirely; the main wasm binary is byte-identical (ARCHIVES was already empty
+of libiconv in the prior `dynamic` mode; only the side-module build and
+EXTRA_MODULES list change). After applying the patch, a full `make` reruns
+the PHP configure + link steps (triggered by ENV_FILE being in DEPENDENCIES):
+
+```bash
+cd ~/scratch/php-wasm-upstream
+git apply ~/php-wasm-async/patches/session2-fp_async_call.patch   # if pristine
+git apply ~/php-wasm-async/patches/session3-suspend.patch
+git apply ~/php-wasm-async/patches/iconv-resolution.patch
+touch source/env.js   # force re-link (same reason as Session 3)
+make PHP_VERSION=8.0 ENV_FILE=.circleci/.env_8.0.ci node-mjs
+```
+
+The rebuild verifies that the iconv drop does not cascade (no linking errors,
+no PHP configure failures). Post-build sizes and test results are in `RESULTS.md`.
 
 ### Later sessions (outline)
 
