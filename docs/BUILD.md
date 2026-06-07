@@ -176,12 +176,60 @@ WordPress Playground experience, which curates an `ASYNCIFY_ONLY` allowlist
 that must be added). See ADR-0008 for the trade-off and its forward
 implications (JSPI port).
 
-### Later sessions (outline, not yet validated)
+### Session 3 — async host implementation + run-path change (validated 2026-06-07)
 
-1. Make `fp_async_call` actually suspend on an unresolved Promise
-   (`Asyncify.handleAsync`) and make the run path await it (`pib_run` is
-   currently called via a synchronous `ccall`). (Session 3)
-2. Wire the binary into the target-runtime loader. (Session 4)
+Upgrades `fp_async_call` from a synchronous stub to a genuine suspend/resume
+point. Two source-only changes (no C recompile; only a re-link is needed because
+`library_fp_async.js` is a JS library merged at link time). Complete, reproducible
+delta committed as `patches/session3-suspend.patch`.
+
+#### The two changes
+
+1. **`source/library_fp_async.js`** — replace the synchronous body with
+   `Asyncify.handleAsync(async () => ...)` wrapping a Promise resolved by
+   `setTimeout(..., 0)`. Add `fp_async_call__async: true` annotation. The
+   `__async: true` annotation is the established Emscripten pattern (confirmed in
+   `jsifier.mjs:441` of the seanmorris 3.1.68 fork) — it marks this function as
+   participating in Asyncify at the JS-codegen level.
+
+2. **`source/PhpBase.mjs` `_run()`** — add `{async: true}` to the `php.ccall`
+   for `pib_run`. This is the critical run-path fix: without it, Emscripten's ccall
+   wrapper returns the Asyncify "async in progress" sentinel synchronously and
+   discards the result — the stack unwinds but never rewinds. With `{async: true}`,
+   ccall returns a Promise that Emscripten resolves only after the full Asyncify
+   suspend/resume cycle completes.
+
+#### How to reproduce
+
+Apply both session patches on top of the upstream baseline, then trigger a
+re-link. The re-link is needed because `library_fp_async.js` is not in the
+Makefile's `DEPENDENCIES`, so Make does not detect the change automatically —
+touch `source/env.js` (which IS in `PRE_JS_FILES → PRE_JS_CACHE → DEPENDENCIES`)
+to force the link step without a full PHP recompile:
+
+```bash
+cd ~/scratch/php-wasm-upstream
+# Apply sessions 2 and 3 on a clean upstream checkout
+git apply ~/php-wasm-async/patches/session2-fp_async_call.patch
+git apply ~/php-wasm-async/patches/session3-suspend.patch
+# Force re-link (library_fp_async.js is not auto-tracked by Make)
+touch source/env.js
+make PHP_VERSION=8.0 ENV_FILE=.circleci/.env_8.0.ci node-mjs
+```
+
+The `.wasm` binary is identical to Session 2 (the Asyncify-capable binary from
+Session 2 already contains everything needed; the async logic lives in the JS
+glue). Only the JS glue is re-emitted. Verify:
+
+```bash
+node test-session3.mjs    # before:/after: 42 + ordering markers — PASS
+node test-regression.mjs  # hello/8.0.30 — PASS
+```
+
+### Later sessions (outline)
+
+1. Wire the binary into the target-runtime loader. (Session 4)
+2. Confirm in deployed Worker; JSPI evaluation. (Session 5)
 
 ## Known fragile steps
 

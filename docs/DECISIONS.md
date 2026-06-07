@@ -10,6 +10,38 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0010 — PoC result: Asyncify suspend/resume confirmed in Node V8 (Session 3 PASS)
+**Date:** 2026-06-07 · **Status:** Accepted
+
+**Decision.** The proof-of-concept primitive is **confirmed**. Session 3 satisfies
+the ADR-0006 hard-kill criterion; the project proceeds to Session 4 (workerd port).
+
+**Evidence.** The canonical PoC PHP script:
+```php
+<?php echo "before:\n"; $r = fp_async_call(41); echo "after: " . $r . "\n";
+```
+produces `before:\nafter: 42\n` in Node V8, and host-side ordering markers confirm:
+1. `[fp_async_call] invoked payload=41`
+2. `[fp_async_call] promise registered, returning control to host`
+3. `[fp_async_call] timer fired, resolving promise -> 42`   ← after the event loop turned
+4. `[fp_async_call] wasm resumed, returning 42`
+
+The `42` originated from a `setTimeout(0)` macrotask that had **not** resolved when
+`fp_async_call` was invoked. The ordering is unambiguous: steps 3–4 cannot occur
+before step 2, and a `setTimeout(0)` callback cannot fire synchronously.
+
+**What the session proved.** Two JS-only source changes suffice; no C recompile
+is needed. `library_fp_async.js` uses `Asyncify.handleAsync` with a deferred
+Promise; `PhpBase.mjs` `_run()` passes `{async: true}` to the `pib_run` ccall.
+The `{async: true}` run-path fix is the critical new finding of this session:
+without it, Emscripten's ccall wrapper discards the Asyncify sentinel on a
+synchronous return and the stack never rewinds.
+
+**Forward implications.** Proceed to Session 4. Resolve the libiconv LGPL finding
+(ADR-0009 deferred item) before Session 4 begins, as that changes the binary.
+
+---
+
 ## ADR-0009 — Defer libiconv LGPL resolution from "before Session 3" to "before Session 4 / before any publish or deploy"
 **Date:** 2026-06-07 · **Status:** Accepted
 

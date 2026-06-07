@@ -3,11 +3,10 @@
 Benchmarks and findings — what works, what does not, with evidence.
 Negative results are first-class and are recorded here, not glossed over.
 
-> **Status: Session 1 complete (2026-06-03).** The unmodified PHP 8.0.30
-> baseline binary is built from source and confirmed running synchronously in
-> Node V8. Sizes and timings are recorded below, along with negative results
-> (a build-prerequisite gotcha, an environment restart, and an LGPL link-audit
-> finding). The proof-of-concept (Session 3) is still pending.
+> **Status: Session 3 complete (2026-06-07). PROOF-OF-CONCEPT PASSED.** PHP
+> suspended on an unresolved Promise, the event loop turned, and PHP resumed
+> with the resolved value `42`. The ADR-0006 hard-kill criterion is satisfied.
+> Session 4 (port to workerd) is next. Sizes, timings, and ordering proof below.
 
 ---
 
@@ -132,15 +131,98 @@ There were **no** suspend-related crashes to resolve, so the list is simply
 side of the ADR-0006 kill criterion: the feared "imports-list balloon" does
 not occur on this pipeline. See ADR-0008 for the trade-off and JSPI caveat.
 
-## Proof-of-concept result
+## Proof-of-concept result — Session 3 (2026-06-07)
 
-*Pending Session 3.* To be recorded:
+**PASS.** PHP suspended on an unresolved Promise and resumed with the resolved
+value `42`. The ADR-0006 hard-kill criterion is satisfied; Node V8 is not the
+problem. Session 4 (port to workerd) is the next step.
 
-- Pass/fail against the success criteria.
-- The exact PHP program run and the stdout produced.
-- Confirmation of suspend/resume ordering from host-side logs.
-- If failed: the exact stack trace and the failing function, so the negative
-  result is reproducible and informative.
+### PHP program run (exact)
+
+```php
+<?php
+echo "before:\n";
+$r = fp_async_call(41);
+echo "after: " . $r . "\n";
+```
+
+### stdout (both runs)
+
+```
+before:
+after: 42
+```
+
+### Host-side ordering confirmation
+
+The ordering markers from `library_fp_async.js` (logged to stderr) confirm the
+correct suspend/resume sequence. Both runs:
+
+```
+[fp_async_call] invoked payload=41
+[fp_async_call] promise registered, returning control to host
+[fp_async_call] timer fired, resolving promise -> 42
+[fp_async_call] wasm resumed, returning 42
+```
+
+The `timer fired` line appears **after** `returning control to host` — this is
+unambiguous: the host-side timer macrotask fires only after `fp_async_call` has
+returned the Asyncify sentinel and control is back in the event loop. PHP could
+not have continued synchronously; the only path to `after: 42` is via the
+Promise resolving and Asyncify rewinding the call stack.
+
+### What changed (the two Session 3 deltas, committed as `patches/session3-suspend.patch`)
+
+1. **`source/library_fp_async.js`** — replaced the synchronous `return (payload | 0) + 1`
+   body with `Asyncify.handleAsync(async () => ...)` wrapping a Promise resolved by
+   `setTimeout(..., 0)` (a genuine macrotask, the strongest proof form). Added
+   `fp_async_call__async: true` annotation (confirmed present in Emscripten 3.1.68's
+   `jsifier.mjs` — tells the linker this function participates in Asyncify). Added
+   four ordering markers to stderr.
+
+2. **`source/PhpBase.mjs` `_run()`** — added `{async: true}` to the `php.ccall('pib_run', ...)`
+   call. Without this, Emscripten's ccall wrapper returns the Asyncify sentinel
+   immediately (a synchronous return) instead of driving the Asyncify resume loop,
+   so the wasm stack would unwind and never rewind. With `{async: true}`, ccall
+   returns a Promise that resolves when Asyncify completes the full suspend/resume
+   round-trip.
+
+### Binary sizes (Session 3 vs Session 2)
+
+The `.wasm` binary is **identical** to Session 2 (12,183,180 B raw) — the only
+source change was to the JS library (`library_fp_async.js`), which is merged into
+the Emscripten JS glue, not the wasm binary. The glue grew by 449 B raw.
+
+| Artifact               | Session 2     | Session 3     | Delta   |
+|------------------------|---------------|---------------|---------|
+| `…node.mjs.wasm` raw   | 12,183,180 B  | 12,183,180 B  | 0 B     |
+| `…node.mjs` glue raw   | 315,807 B     | 316,256 B     | +449 B  |
+
+### Latency (Session 3, Node V8)
+
+Measured with `test-session3.mjs` (single run each; not a statistical median).
+
+| Metric              | Session 1 baseline | Session 3        |
+|---------------------|--------------------|------------------|
+| Cold (instantiation)| ~98 ms             | ~91 ms           |
+| Warm (2nd instance) | ~57 ms             | ~51 ms           |
+| Exec (run 1)        | ~0.04 ms           | ~8 ms            |
+| Exec (run 2)        | ~0.04 ms           | ~2 ms            |
+
+The exec cost increase (~8 ms run 1, ~2 ms run 2) is the Asyncify suspend/resume
+round-trip plus the `setTimeout(0)` event-loop turn. This is not a concern for the
+PoC; it will be refined in Session 5 (JSPI comparison) where per-call overhead is
+the explicit measurement target.
+
+### Regression
+
+Session 1 and 2 baseline still passes:
+```
+$ node test-regression.mjs
+hello: "hello\n"
+version: "8.0.30"
+RESULT: PASS
+```
 
 ## Asyncify vs JSPI comparison
 

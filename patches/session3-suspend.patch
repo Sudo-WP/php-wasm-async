@@ -1,0 +1,65 @@
+diff --git a/source/PhpBase.mjs b/source/PhpBase.mjs
+index 74818aae..a4f036eb 100644
+--- a/source/PhpBase.mjs
++++ b/source/PhpBase.mjs
+@@ -327,6 +327,7 @@ export class PhpBase extends EventTarget
+ 				, NUM
+ 				, [STR]
+ 				, [`?>${phpCode}`]
++				, {async: true}
+ 			);
+ 		})
+ 		.finally(() => this.flush());
+diff --git a/source/library_fp_async.js b/source/library_fp_async.js
+new file mode 100644
+index 00000000..97428767
+--- /dev/null
++++ b/source/library_fp_async.js
+@@ -0,0 +1,47 @@
++// fp_async_call — the php-wasm-async async host-call bridge import.
++//
++// php-wasm-async, Session 3. Upgrades the Session 2 synchronous stub to a
++// genuine suspend/resume point using Asyncify.handleAsync.
++//
++// The host implementation returns a Promise that is NOT resolved at the moment
++// fp_async_call is invoked by PHP. Resolution is deferred to a later event-loop
++// tick via a zero-delay macrotask (setTimeout). This is the strongest possible
++// proof form: there is no way the wasm stack can continue synchronously.
++//
++// Ordering markers are logged to stderr so the host-side sequence is
++// unambiguous in the test output:
++//   [fp_async_call] invoked payload=41
++//   [fp_async_call] promise registered, returning control to host
++//   [fp_async_call] timer fired, resolving promise -> 42
++//   [fp_async_call] wasm resumed, returning 42
++//
++// Asyncify.handleAsync wraps the async () => ... function and suspends the
++// Asyncify call stack until the returned Promise settles, then resumes it with
++// the resolved value. This requires:
++//   - fp_async_call listed in ASYNCIFY_IMPORTS (done in Session 2 Makefile),
++//   - the run path (pib_run ccall) to pass {async:true} so Emscripten drives
++//     the Asyncify resume loop (done in PhpBase.mjs _run — Session 3 change).
++//
++// Apache-2.0, the php-wasm-async authors. Original work, not derived from any
++// GPL source; merged into the Emscripten JS library at link time.
++
++mergeInto(LibraryManager.library, {
++	// int fp_async_call(int payload)
++	fp_async_call__async: true,
++	fp_async_call: function (payload) {
++		const p = payload | 0;
++		return Asyncify.handleAsync(async () => {
++			console.error('[fp_async_call] invoked payload=' + p);
++			const result = await new Promise(resolve => {
++				console.error('[fp_async_call] promise registered, returning control to host');
++				setTimeout(() => {
++					const value = p + 1;
++					console.error('[fp_async_call] timer fired, resolving promise -> ' + value);
++					resolve(value);
++				}, 0);
++			});
++			console.error('[fp_async_call] wasm resumed, returning ' + result);
++			return result;
++		});
++	},
++});

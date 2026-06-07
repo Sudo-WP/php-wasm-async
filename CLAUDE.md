@@ -31,14 +31,21 @@ See `docs/DESIGN.md`.
 1. **Before starting:** read the docs relevant to the task — at minimum
    `docs/HANDOFF.md` (current state + next action) and `docs/DECISIONS.md`
    (binding decisions), plus `docs/DESIGN.md`, `docs/BUILD.md`, or
-   `docs/RESULTS.md` as the task touches them. Do not contradict an
-   accepted decision; if a decision genuinely needs to change, record a new
-   dated ADR that supersedes the old one rather than quietly diverging.
-2. **During:** stay within the decided approach (Asyncify first, JSPI as a
-   later optimization; Emscripten 4.0.19; PHP 8.0.30). Flag — do not
-   silently work around — anything that conflicts with a decision or a
-   documented constraint.
-3. **After completing the task, update the docs so they reflect reality:**
+   `docs/RESULTS.md` as the task touches them.
+2. **Decision changes are recorded, never silent.** Do not contradict an
+   accepted decision. If a task (or the prompt driving it) changes a
+   previously-documented decision — even a sensible change — **record a new
+   dated ADR that supersedes the old one, and reconcile every affected doc
+   (HANDOFF, BUILD, etc.), as the FIRST step, before any code or build work.**
+   A prompt that diverges from the docs without an ADR is itself the bug:
+   treat the reconciling ADR as part of the task, not an afterthought. Commit
+   the decision change as its own isolated, legible step.
+3. **During:** stay within the decided approach — Asyncify first, JSPI as a
+   later optimization (ADR-0002); PHP 8.0.30 (ADR-0004); Emscripten = the
+   seanmorris `sm-updates` fork as built in Session 1 (ADR-0007), **not** stock
+   4.0.19. Flag — do not silently work around — anything that conflicts with a
+   decision or a documented constraint.
+4. **After completing the task, update the docs so they reflect reality:**
    - `docs/BUILD.md` — replace "to be validated" scaffolding with the build
      steps that actually ran.
    - `docs/RESULTS.md` — record outcomes with evidence, including negative
@@ -47,14 +54,22 @@ See `docs/DESIGN.md`.
    - `docs/DECISIONS.md` — add a dated ADR if a new decision was made.
    Be rigorously honest: document what failed, not just what worked.
 
-## Toolchain (pinned — see `docs/BUILD.md`)
+## Toolchain (pinned — see `docs/BUILD.md` and ADR-0007)
 
-- Emscripten SDK **4.0.19** — `source ~/emsdk/emsdk_env.sh` to put `emcc`
-  on PATH (it is intentionally not auto-loaded).
+- Emscripten = the **seanmorris/emscripten `sm-updates` fork** (effective
+  `emcc ~3.1.68-git`, on an `emscripten/emsdk:3.1.67` base), built into the
+  pipeline's Docker image. This — **not** stock 4.0.19 — is the toolchain the
+  reference pipeline validates against and the one this project builds with
+  (ADR-0007 superseded ADR-0004 on this point). The host `~/emsdk` 4.0.19 is
+  incidental: handy for ad-hoc `emcc` checks only; the build runs inside the
+  Docker builder image.
 - PHP **8.0.30** source baseline.
 - Node.js for running/benchmarking outside the runtime. Benchmark in Node
   V8 — the in-Worker clock clamps to 1s precision.
-- The reference build pipeline is container-based; builds run in Docker.
+- The reference build pipeline is container-based; builds run in Docker. The
+  pipeline checkout lives at `~/scratch/php-wasm-upstream/` (outside this
+  repo). Run `npm install` there before `make`, or the build recurses
+  infinitely (RESULTS negative result #1).
 
 ## Don't
 
