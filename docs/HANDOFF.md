@@ -102,16 +102,16 @@ Carry these forward as explicit risks rather than assumptions:
    in the target serverless runtime in third-party projects, but it is
    compatibility-date gated and not documented as a first-class stable
    feature. Confirm empirically before committing to it for production.
-2. **Link-time license audit — OPEN FINDING, MUST RESOLVE BEFORE SESSION 3 /
-   BEFORE ANY PUBLISH.** The build statically links **GNU libiconv 1.17
-   (LGPL-2.1-or-later)** — an LGPL component in the static link, exactly the
-   case ADR-0001 flagged. `readline` (GPL) is correctly excluded. Left
-   untouched in Session 2 on purpose (resolving it changes the binary and
-   would have contaminated the clean "+1 import" diff). It must be resolved
-   before Session 3 / before publishing any binary: meet the LGPL obligations
-   for a static artifact, or drop/replace iconv. OpenSSL here is 1.1.1x
-   (legacy dual OpenSSL/SSLeay license). See `NOTICE` and `RESULTS.md`
-   negative result #3.
+2. **Link-time license audit — OPEN FINDING, MUST RESOLVE BEFORE SESSION 4 /
+   BEFORE ANY PUBLISH OR DEPLOY (deferred by ADR-0009).** The build statically
+   links **GNU libiconv 1.17 (LGPL-2.1-or-later)** — an LGPL component in the
+   static link, exactly the case ADR-0001 flagged. `readline` (GPL) is correctly
+   excluded. Left untouched in Sessions 2 and 3 on purpose (resolving it changes
+   the binary and would contaminate the clean diffs; the async mechanism is
+   orthogonal to iconv — see ADR-0009). It must be resolved before Session 4 /
+   before publishing any binary: meet the LGPL obligations for a static artifact,
+   or drop/replace iconv. OpenSSL here is 1.1.1x (legacy dual OpenSSL/SSLeay
+   license). See `NOTICE` and `RESULTS.md` negative result #3.
 3. **Exhaustive suspendable-imports list.** The most likely time-sink. Adding
    one async import can surface a chain of functions that must also be made
    suspendable, each discovered only by crashing and reading the stack trace.
@@ -137,7 +137,7 @@ ordering (control returns to host → event loop turns → Promise resolves → 
 resumes). See ADR-0005. The ADR-0006 hard-kill criterion applies at the end of
 Session 3.
 
-**Blocker to clear first:** resolve the **libiconv LGPL** link-audit finding
-(open risk #2) — it is marked must-resolve-before-Session-3 / before any
-publish. Decide whether to meet the LGPL static-link obligations or drop/replace
-iconv, since that changes the binary Session 3 will measure.
+**Immediate pre-Session-4 obligation:** resolve the **libiconv LGPL** link-audit
+finding (open risk #2) — deferred from "before Session 3" to "before Session 4 /
+before any publish or deploy" by ADR-0009. Decide whether to meet the LGPL
+static-link obligations or drop/replace iconv before Session 4 begins.

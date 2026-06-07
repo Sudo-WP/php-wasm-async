@@ -10,6 +10,37 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0009 — Defer libiconv LGPL resolution from "before Session 3" to "before Session 4 / before any publish or deploy"
+**Date:** 2026-06-07 · **Status:** Accepted
+
+**Decision.** The libiconv LGPL open risk — originally marked "must resolve before
+Session 3 / before any publish" in HANDOFF.md — is deferred to **before Session 4
+and before any publish or deploy**. It is not a Session 3 blocker.
+
+**Reasoning.** libiconv is a charset/encoding library; its LGPL status is a
+license-compliance issue, not a correctness issue. Resolving it (by meeting LGPL
+static-link obligations, or by dropping/replacing iconv in the build) changes the
+binary. Session 3's goal is to prove correctness and ordering of the Asyncify
+suspend/resume primitive — a result that is independent of the charset library
+included. A Session 3 pass is equally valid regardless of whether iconv is present
+or replaced in the subsequent binary, because:
+- The async host-call mechanism (`fp_async_call`, `Asyncify.handleAsync`, the run-path
+  `{async: true}` ccall) is orthogonal to iconv.
+- The Session 3 binary is never published or deployed; it is a local test artifact.
+Deferring keeps the Session 3 binary byte-for-byte identical to the Session 2 binary
+(same build flags, same library set), which is the clean "+1 mechanism" diff.
+
+**iconv remains a publish/deploy blocker.** It must be resolved before Session 4
+artifacts are published or before any deployment. The risk stays open in HANDOFF.md,
+re-marked accordingly.
+
+**Alternatives considered.** Resolve iconv before Session 3 as originally required
+(rejected: changes the binary under test, contaminates the clean diff; the compliance
+obligation is orthogonal to the suspend/resume proof and can be satisfied later without
+any fundamental rework).
+
+---
+
 ## ADR-0008 — Rely on whole-program Asyncify; no curated `ASYNCIFY_ONLY` list
 **Date:** 2026-06-03 · **Status:** Accepted
 
