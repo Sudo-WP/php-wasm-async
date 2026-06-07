@@ -223,6 +223,95 @@ version: "8.0.30"
 RESULT: PASS
 ```
 
+## Session 4 — workerd integration attempt (2026-06-08)
+
+**BLOCKED (partial progress).** The Asyncify binary cannot initialize inside
+workerd due to a fundamental incompatibility between Emscripten's dynamic-linking
+stub mechanism (`addFunction` → `convertJsFunctionToWasm`) and workerd's
+restrictions on runtime WebAssembly compilation. The Node V8 result (Session 3
+PASS) stands. Session 5 will target workerd via JSPI with a new build.
+
+**What worked:**
+
+1. **wrangler bundling and wasm delivery.** `wrangler dev` bundles the 12 MB
+   wasm and serves it correctly. The wasm arrives in the worker as a pre-compiled
+   `WebAssembly.Module` object (wrangler compiles it at bundle time). Confirmed:
+   `typeof phpWasm === 'object'`, `phpWasm.constructor.name === 'Module'`.
+
+2. **`instantiateWasm` hook.** The hook intercepting wasm loading works cleanly:
+   ```js
+   instantiateWasm(imports, receive) {
+       WebAssembly.instantiate(phpWasm, imports).then(
+           instance => receive(instance, phpWasm)
+       );
+       return {};
+   }
+   ```
+   `WebAssembly.instantiate(precompiledModule, imports)` succeeds. `receiveInstance`
+   is called with the instance. Confirmed by `[worker] wasm instantiated ok, instance
+   type: object Instance` in the wrangler console.
+
+3. **Glue patches 1 and 2.** Two required patches to the Emscripten worker-env
+   glue were identified and confirmed valid:
+   - `self.location.href` → `(self.location&&self.location.href)||""` — required for
+     workerd ESM module format where `self.location` is undefined at module load time.
+   - Two `addEventListener("message", cb, true)` → `false` — required because workerd
+     forbids `useCapture=true`.
+
+**Hard blocker — patch 3 (ADR-0012):**
+
+Exact error from wrangler console:
+```
+✘ [ERROR] [worker] instantiate error: TypeError: WebAssembly.Table.set():
+  Argument 1 is invalid for table: function-typed object must be null
+  (if nullable) or a Wasm function object
+
+  at setWasmTableEntry (worker/build/php8.0-worker.mjs:9:16213)
+  at addFunction (worker/build/php8.0-worker.mjs:9:16508)
+  at reportUndefinedSymbols (worker/build/php8.0-worker.mjs:9:27138)
+  at loadDylibs (worker/build/php8.0-worker.mjs:9:27344)
+  at receiveInstance (worker/build/php8.0-worker.mjs:9:7882)
+```
+
+Call chain: `receiveInstance → loadDylibs → reportUndefinedSymbols → addFunction
+→ convertJsFunctionToWasm → new WebAssembly.Module(bytes)`.
+
+workerd blocks `new WebAssembly.Module(bytes)` at runtime ("Wasm code generation
+disallowed by embedder") and does not provide `WebAssembly.Function` (the type
+reflections API that would avoid it). `WebAssembly.Table.set()` rejects plain JS
+functions — only proper wasm-typed functions are accepted.
+
+The four undefined symbols (`xmlStrdup`, `xmlStrncmp`, `xmlURIUnescapeString`,
+`xmlUnlinkNode`) are called during `php_embed_init('embed')` via ext/libxml MINIT →
+`xmlInitParser()`. These fire before any PHP code runs; the stubs cannot be deferred.
+
+**Workarounds attempted:**
+- `reportUndefinedSymbols` no-op → GOT entries remain 0 → `RuntimeError: unreachable`
+  trap when `xmlInitParser()` calls them via null function-table index.
+- `convertJsFunctionToWasm = (f, sig) => f` (return raw JS) → `WebAssembly.Table.set()`
+  rejects it with the same error above.
+
+**JSPI probe result (2026-06-08):**
+
+A probe worker confirmed that workerd (wrangler 4.96.0, compatibility date
+2024-09-23) provides JSPI natively:
+```
+WebAssembly keys: ... Suspending, promising, SuspendError
+WebAssembly.Function: undefined
+```
+`WebAssembly.Suspending` and `WebAssembly.promising` are available.
+`WebAssembly.Function` (needed by Asyncify stubs) is not.
+
+Session 4 artifacts:
+- `worker/index.mjs` — workerd loader entry point (committed; status: BLOCKED)
+- `wrangler.toml` — wrangler project config (committed)
+- `patches/session4-workerd-analysis.patch` — three-patch analysis with workaround
+  evidence (committed)
+
+See ADR-0012 (blocker) and ADR-0013 (JSPI path) in `DECISIONS.md`.
+
+---
+
 ## Asyncify vs JSPI comparison
 
 *Pending Session 5.* To be recorded:

@@ -10,6 +10,101 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0013 — JSPI confirmed available in workerd; designated path for workerd integration
+**Date:** 2026-06-08 · **Status:** Accepted · **Depends on:** ADR-0012
+
+**Decision.** JSPI (JavaScript-Promise Integration) is the designated mechanism for
+the workerd integration. Session 4 probe confirmed that workerd (wrangler 4.96.0,
+compatibility date 2024-09-23) natively provides `WebAssembly.Suspending`,
+`WebAssembly.promising`, and `WebAssembly.SuspendError`. Asyncify is NOT the right
+approach for workerd (see ADR-0012 for why). JSPI avoids Asyncify instrumentation
+entirely and uses the runtime's native suspension mechanism.
+
+**What was probed.** A minimal worker (`export default { fetch() { return new Response(Object.getOwnPropertyNames(WebAssembly).join(', ')); } }`) returned:
+```
+WebAssembly.Function: undefined
+WebAssembly keys: compile, validate, instantiate, Module, Instance, Table, Memory, Global, Tag, JSTag, Exception, CompileError, LinkError, RuntimeError, Suspending, promising, SuspendError
+```
+
+Key findings:
+- `WebAssembly.Suspending` and `WebAssembly.promising` are available — JSPI works.
+- `WebAssembly.Function` (type reflections proposal) is NOT available — needed by
+  Emscripten's `addFunction` for dynamic-linking stubs (ADR-0012 blocker).
+- `new WebAssembly.Module(bytes)` is blocked at runtime — same ADR-0012 blocker.
+
+**JSPI approach for Session 5.** The correct workerd build will:
+1. Rebuild PHP wasm with `-sJSPI=1` (Emscripten JSPI) and `JSPI_IMPORTS=fp_async_call`.
+2. Resolve the dynamic-linking blocker (ADR-0012) — either by rebuilding without
+   MAIN_MODULE (static-only) or with `--disable-libxml` to eliminate undefined symbols.
+3. Use `WebAssembly.Suspending` to wrap `fp_async_call` as a suspending import.
+4. Use `WebAssembly.promising` to wrap `pib_run` as a Promise-returning export.
+5. The `await pib_run(...)` call then suspends/resumes without any Asyncify
+   instrumentation in the wasm binary.
+
+JSPI was always the planned Session 5 optimization; the Session 4 finding
+accelerates that plan to replace Asyncify entirely for the workerd target.
+
+---
+
+## ADR-0012 — workerd hard stop: Asyncify+MAIN_MODULE binary incompatible with workerd
+**Date:** 2026-06-08 · **Status:** Accepted · **Per:** ADR-0006 hard-stop criterion
+
+**Decision.** Session 4 encountered a hard blocker: the Asyncify binary built by the
+seanmorris pipeline with `MAIN_MODULE=1` (dynamic linking) cannot initialize in
+workerd. The project stops the Asyncify workerd path and records the blocker.
+The Node V8 result (Session 3 PASS) stands and is the permanent evidence that the
+Asyncify primitive works. Session 5 will target workerd via JSPI with a new binary.
+
+**Root cause (three-level failure chain).**
+```
+receiveInstance → loadDylibs → reportUndefinedSymbols → addFunction
+→ convertJsFunctionToWasm → new WebAssembly.Module(bytes) → BLOCKED
+```
+1. The seanmorris pipeline links the main wasm with `MAIN_MODULE=1`, enabling
+   dynamic side-module loading. The GOT (Global Offset Table) is part of the
+   binary's dynamic-linking infrastructure.
+2. Four libxml2 symbols (`xmlStrdup`, `xmlStrncmp`, `xmlURIUnescapeString`,
+   `xmlUnlinkNode`) are referenced by root C code but unresolved in the static
+   archives. The dynamic-linking runtime (`reportUndefinedSymbols`) tries to
+   create JS stub functions and add them to the wasm function table.
+3. Adding JS stubs to the wasm function table requires creating wasm-typed
+   functions. Emscripten does this via:
+   - `WebAssembly.Function` (type reflections) — NOT in workerd.
+   - `new WebAssembly.Module(bytes)` — BLOCKED in workerd ("Wasm code generation
+     disallowed by embedder"). `WebAssembly.Table.set()` rejects plain JS functions.
+4. The stubs ARE needed at startup (not just when XML functions are called):
+   ext/libxml is a statically-compiled PHP extension; its MINIT function calls
+   `xmlInitParser()` during `php_module_startup()` → `php_embed_init()` → our
+   `pib_init('embed')`. This fires before any PHP code runs.
+
+**What worked (up to the blocker).**
+- Three glue patches discovered and validated:
+  1. `self.location.href` guard — required for workerd ESM module format (vs.
+     service worker format where `self.location` is always defined).
+  2. `addEventListener(..., true)` → `false` — required (workerd forbids capture).
+  3. `instantiateWasm` hook — WORKS: WebAssembly.instantiate(precompiledModule,
+     imports) succeeds; wasm instantiates; receiveInstance is called.
+- wrangler 4.96.0 bundles and serves the 12 MB wasm correctly.
+- The wasm instantiation itself (WebAssembly.instantiate from a pre-compiled
+  WebAssembly.Module) is completely unblocked.
+
+**Workarounds attempted and why they fail.**
+- Make `reportUndefinedSymbols` a no-op: GOT entries remain 0; wasm calls via
+  those entries hit index 0 (`unreachable` trap) during `xmlInitParser`.
+- Return raw JS function from `convertJsFunctionToWasm`: `WebAssembly.Table.set()`
+  rejects it — "function-typed object must be null or a Wasm function object".
+- Dummy table index in GOT: wrong function called with wrong signature → type
+  mismatch or corruption during `xmlInitParser`.
+
+**Path forward (Session 5).**
+- ADR-0013: use JSPI (natively available in workerd).
+- Build change required: rebuild without MAIN_MODULE (or with `--disable-libxml`
+  to drop ext/libxml and its libxml2 undefined symbols), plus `-sJSPI=1`.
+- This is a targeted rebuild of the link step (no PHP recompile if only link
+  flags change). Estimated: 5–15 minutes (link-only, no C recompile).
+
+---
+
 ## ADR-0011 — Libiconv LGPL resolution: drop `WITH_ICONV=0`; corrects NOTICE analysis error
 **Date:** 2026-06-07 · **Status:** Accepted · **Resolves:** ADR-0009 deferred obligation
 

@@ -1,0 +1,95 @@
+This file documents the three patches needed to adapt the Emscripten worker-env
+glue (php8.0-worker.mjs) for Cloudflare Workers / workerd ESM module format,
+identified during Session 4 (2026-06-08). These patches are applied to the
+build artifact worker/build/php8.0-worker.mjs before running wrangler dev.
+
+Status: patches 1 and 2 are valid and necessary. Patch 3 documents the
+remaining hard blocker (ADR-0012). A full solution requires either a build
+change (ADR-0012) or switching to JSPI (ADR-0013).
+
+--- Patch 1: self.location guard (required) ---
+In workerd ESM module format, self.location is undefined (only available in
+service worker format). The Emscripten worker-env glue tries self.location.href
+at module-load time. Guard it to allow the module to initialize.
+
+Symptom: TypeError: Cannot read properties of undefined (reading 'href')
+at convertJsFunctionToWasm / at module load.
+
+Change in php8.0-worker.mjs:
+  OLD: if(ENVIRONMENT_IS_WORKER){scriptDirectory=self.location.href}
+  NEW: if(ENVIRONMENT_IS_WORKER){scriptDirectory=(self.location&&self.location.href)||""}
+
+Note: scriptDirectory is immediately overridden by _scriptName (import.meta.url),
+so the empty fallback has no effect on wasm loading (which is overridden via
+instantiateWasm anyway).
+
+--- Patch 2: addEventListener useCapture=false (required) ---
+Emscripten's browser and emSetImmediate polyfills register message event
+listeners with useCapture=true. workerd only supports useCapture=false.
+
+Symptom: TypeError: addEventListener(): useCapture must be false.
+
+Changes in php8.0-worker.mjs:
+  OLD: addEventListener("message",Browser_setImmediate_messageHandler,true)
+  NEW: addEventListener("message",Browser_setImmediate_messageHandler,false)
+
+  OLD: addEventListener("message",__setImmediate_cb,true)
+  NEW: addEventListener("message",__setImmediate_cb,false)
+
+Note: These polyfills are for Emscripten's emSetImmediate / Browser.setImmediate.
+The setImmediate mechanism is NOT on the critical path for our Asyncify PoC
+(Asyncify uses Promise chains for resume, not emSetImmediate). The capture/bubble
+distinction is irrelevant for these synthetic postMessage-based events.
+
+--- Patch 3: convertJsFunctionToWasm / addFunction (HARD BLOCKER — ADR-0012) ---
+Emscripten's addFunction() wraps a JS function into a wasm-typed function for
+insertion into the wasm function table. This is needed by reportUndefinedSymbols()
+to create stubs for libxml2 symbols (xmlStrdup, xmlStrncmp, xmlURIUnescapeString,
+xmlUnlinkNode) that are undefined in the main wasm but referenced via dynamic
+linking (MAIN_MODULE=1). Emscripten's implementation:
+
+  1. If WebAssembly.Function available → use it (type reflections proposal)
+  2. Else → create a tiny WebAssembly.Module from bytes and extract its export
+
+workerd blocks option 2 ("Wasm code generation disallowed by embedder") and
+does not provide option 1 (WebAssembly.Function = undefined). The table element
+type is anyfunc (funcref) and workerd enforces that all elements are proper
+wasm functions (WebAssembly.Table.set() rejects plain JS functions).
+
+The undefined symbols ARE called during php_embed_init('embed') via:
+  ext/libxml MINIT → xmlInitParser() → xmlStrdup() etc.
+
+These are called because ext/libxml is a statically compiled PHP extension
+(not a dynamic side module in this build), and MINIT runs during php_module_startup()
+before any PHP code executes.
+
+Resolution: ADR-0012 (build change required). Either:
+  A. Rebuild with --disable-libxml (drops ext/libxml, DOM, SimpleXML) — allows
+     static linking without undefined symbols, workerd compatible.
+  B. Rebuild with full static libxml2 (no MAIN_MODULE, no GOT/side module
+     infrastructure) — all libxml2 symbols in ARCHIVES, no stubs needed.
+  C. Switch to JSPI — workerd natively provides WebAssembly.Suspending and
+     WebAssembly.promising (confirmed in workerd 2024-09-23 compatibility date).
+     JSPI avoids Asyncify instrumentation entirely and avoids the stub issue IF
+     the binary is rebuilt without MAIN_MODULE.
+
+Tested workarounds that don't fully solve it:
+  - Making reportUndefinedSymbols a no-op → GOT entries remain 0 → wasm
+    unreachable trap when xmlInitParser calls them.
+  - Returning raw JS function from convertJsFunctionToWasm → wasmTable.set()
+    rejects it ("function-typed object must be null or a Wasm function object").
+  - Setting GOT entry.value to a dummy table index → wrong function called with
+    wrong signature → type mismatch trap or silent corruption.
+
+--- Session 4 findings summary ---
+1. instantiateWasm hook: WORKS — wasm instantiates, receiveInstance is called.
+2. Patches 1+2 (self.location, addEventListener): WORK — module loads cleanly.
+3. Wasm instantiation via pre-compiled WebAssembly.Module: WORKS — no runtime
+   compilation needed for this step.
+4. php_embed_init: BLOCKS at reportUndefinedSymbols via addFunction (patch 3).
+5. JSPI availability: CONFIRMED — WebAssembly.Suspending, WebAssembly.promising,
+   WebAssembly.SuspendError are all available in workerd (probed 2026-06-08).
+   This makes JSPI the correct path for the workerd integration.
+
+Applies to: worker/build/php8.0-worker.mjs (build artifact, not tracked in git).
+Apply with: cd worker/build && python3 apply-workerd-patches.py (not yet written).

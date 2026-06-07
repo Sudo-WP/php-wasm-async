@@ -256,10 +256,111 @@ make PHP_VERSION=8.0 ENV_FILE=.circleci/.env_8.0.ci node-mjs
 The rebuild verifies that the iconv drop does not cascade (no linking errors,
 no PHP configure failures). Post-build sizes and test results are in `RESULTS.md`.
 
-### Later sessions (outline)
+### Session 4 — workerd integration attempt (2026-06-08, BLOCKED)
 
-1. Wire the binary into the target-runtime loader. (Session 4)
-2. Confirm in deployed Worker; JSPI evaluation. (Session 5)
+**Goal:** wire the Session 3 binary into a Cloudflare Worker and confirm
+suspend/resume in workerd locally via `wrangler dev`.
+
+**Build artifact used:** `php8.0-worker.mjs` + `php8.0-worker.mjs.wasm`
+(built with `make PHP_VERSION=8.0 ENV_FILE=.circleci/.env_8.0.ci worker-mjs`
+from the upstream pipeline). This is the worker-env glue, analogous to the
+node-mjs target. It ships with `ENVIRONMENT_IS_WORKER = true` hardcoded.
+
+**Setup:**
+```bash
+# In the project repo (not the upstream scratch checkout)
+# Install wrangler if not present
+npm install -g wrangler@4.96.0
+
+# Copy built artifacts (gitignored) to worker/build/
+mkdir -p worker/build
+cp ~/scratch/php-wasm-upstream/packages/php-wasm/php8.0-worker.mjs \
+   worker/build/php8.0-worker.mjs
+cp ~/scratch/php-wasm-upstream/packages/php-wasm/php8.0-worker.mjs.wasm \
+   worker/build/php8.0-worker.mjs.wasm
+```
+
+**Three required glue patches** (applied to `worker/build/php8.0-worker.mjs`
+before running wrangler; documented in `patches/session4-workerd-analysis.patch`):
+
+1. `self.location.href` guard (required — workerd ESM has `self.location = undefined`):
+   ```
+   OLD: if(ENVIRONMENT_IS_WORKER){scriptDirectory=self.location.href}
+   NEW: if(ENVIRONMENT_IS_WORKER){scriptDirectory=(self.location&&self.location.href)||""}
+   ```
+
+2. `addEventListener` useCapture fix (required — workerd forbids `true`):
+   ```
+   OLD: addEventListener("message",Browser_setImmediate_messageHandler,true)
+   NEW: addEventListener("message",Browser_setImmediate_messageHandler,false)
+   OLD: addEventListener("message",__setImmediate_cb,true)
+   NEW: addEventListener("message",__setImmediate_cb,false)
+   ```
+
+3. **Patch 3 has no valid JS-level fix** — the `addFunction/convertJsFunctionToWasm`
+   chain requires either `WebAssembly.Function` (unavailable) or `new
+   WebAssembly.Module(bytes)` (blocked). See ADR-0012. This is the hard blocker.
+
+**Run wrangler dev (after patches 1 and 2):**
+```bash
+cd /path/to/php-wasm-async
+wrangler dev --local --port 8787
+# In another terminal:
+curl http://localhost:8787/
+```
+
+**Result:** 500 error. The exact error (from wrangler console):
+```
+[worker] instantiate error: TypeError: WebAssembly.Table.set(): Argument 1 is
+invalid for table: function-typed object must be null (if nullable) or a Wasm
+function object
+  at addFunction → reportUndefinedSymbols → loadDylibs → receiveInstance
+```
+
+**JSPI availability probe:**
+```js
+// Minimal probe worker
+export default { fetch() {
+  const keys = Object.getOwnPropertyNames(WebAssembly).join(', ');
+  const f = typeof WebAssembly.Function;
+  return new Response(`keys: ${keys}\nWebAssembly.Function: ${f}\n`);
+}}
+```
+Result: `Suspending, promising, SuspendError` present; `WebAssembly.Function` undefined.
+
+**Session 4 committed files:**
+- `worker/index.mjs` — workerd loader entry (status: BLOCKED, per comment)
+- `wrangler.toml` — wrangler config
+- `patches/session4-workerd-analysis.patch` — full three-patch analysis
+
+### Session 5 — JSPI build for workerd (outline)
+
+**Goal:** rebuild the PHP wasm with JSPI instead of Asyncify, and without
+dynamic linking (`MAIN_MODULE=0` or `--disable-libxml`), to eliminate both the
+Asyncify instrumentation and the `addFunction/convertJsFunctionToWasm` blocker.
+
+**Required build changes:**
+1. Drop or stub libxml2 undefined symbols — either:
+   - `--disable-libxml` in PHP configure (drops ext/dom, ext/simplexml, ext/xml,
+     ext/xmlreader, ext/xmlwriter, ext/soap — acceptable for PoC); or
+   - `MAIN_MODULE=0` rebuild with fully static libxml2 (no GOT, no dynamic stubs).
+2. Add `-sJSPI=1` to Emscripten link flags (replaces `-sASYNCIFY=1`).
+3. Add `JSPI_IMPORTS=fp_async_call` to mark `fp_async_call` as a suspending import.
+
+**Worker entry changes for JSPI:**
+```js
+// Wrap the import as a JSPI suspending function
+const suspendingFpAsync = new WebAssembly.Suspending(
+    async (payload) => { /* resolve promise */ return payload + 1; }
+);
+// Provide it in the imports object under env.fp_async_call
+// Wrap the export as a promising function
+const promisingRun = WebAssembly.promising(instance.exports.pib_run);
+// Then: await promisingRun('?>' + PHP_CODE);
+```
+
+This approach avoids all Asyncify glue, avoids the `addFunction` chain,
+and uses workerd's native JSPI support confirmed in Session 4.
 
 ## Known fragile steps
 
