@@ -1,6 +1,4 @@
-This patch changes WITH_LIBXML from dynamic (the upstream default, `WITH_LIBXML=1`)
-to static (`WITH_LIBXML=static`), and WITH_TIDY from dynamic (`WITH_TIDY=1`) to
-static (`WITH_TIDY=static`). This is the Session 5 surgical linking fix.
+Session 5 linking fix: WITH_LIBXML=static + WITH_TIDY=static + PHP_CONFIGURE_DEPS sentinel.
 
 Background (see DECISIONS.md ADR-0014):
 Session 4 was blocked by the following init-path failure in workerd:
@@ -16,29 +14,26 @@ php_embed_init('embed'). In dynamic mode, libxml2 is a WASM side module
 (DYNAMIC_LIBS_GROUPED+= xml-libs, LIBXML_DYNAMIC_LOAD=1). The symbols are
 expected to come from the side module at runtime, not from the main binary.
 
-In workerd, the stub-creation path (addFunction → convertJsFunctionToWasm) is
-blocked because workerd disallows runtime WebAssembly.Module() compilation and
-lacks WebAssembly.Function. No JS-level workaround is possible.
-
 Fix: WITH_LIBXML=static adds lib/lib/libxml2.a to ARCHIVES (statically linked into
 the main binary) and does NOT add xml-libs to DYNAMIC_LIBS_GROUPED. The four
 undefined symbols are resolved at link time. reportUndefinedSymbols finds nothing
-undefined in the GOT → addFunction is never called → no blocked wasm compilation.
+undefined in the GOT → addFunction is never called → workerd init unblocked.
 
 WITH_TIDY=static is required because WITH_TIDY=dynamic requires WITH_LIBXML=dynamic
 (enforced by php-wasm-tidy/static.mak). Changing to static links libtidy.a into
-the main binary as well.
+the main binary as well. Both libxml2.a and libtidy.a must be pre-built.
 
-Changes vs. the upstream baseline (on top of sessions 2, 3, iconv-resolution):
-- WITH_LIBXML=1 → WITH_LIBXML=static in .circleci/.env_8.0.ci
-- WITH_TIDY=1  → WITH_TIDY=static  in .circleci/.env_8.0.ci
-- WITH_ICONV=1 → WITH_ICONV=0 (iconv-resolution patch, already applied)
+Makefile fix: WITH_LIBXML=static removes the only entry that was in PHP_CONFIGURE_DEPS
+(packages/libxml/libxml2.so, added only in dynamic/shared modes). An empty
+PHP_CONFIGURE_DEPS causes `$(MAKE) ${PHP_CONFIGURE_DEPS}` to become bare `$(MAKE)`
+which invokes the default goal `all` → `_all` → infinite recursion. The fix seeds
+PHP_CONFIGURE_DEPS with lib/lib/libxml2.a (already built) as a sentinel.
 
-Apply order:
+Apply order (from a clean upstream checkout):
   1. patches/session2-fp_async_call.patch
   2. patches/session3-suspend.patch
   3. patches/iconv-resolution.patch
-  4. patches/session5-static-libxml.patch  ← this file (git apply from upstream root)
+  4. patches/session5-static-libxml.patch  ← this file
 
 --- a/.circleci/.env_8.0.ci
 +++ b/.circleci/.env_8.0.ci
@@ -63,10 +58,15 @@ Apply order:
 -WITH_TIDY=1
 +WITH_TIDY=static
 
-Note: the WITH_ICONV=0 line above belongs to the iconv-resolution patch
-(already applied in the upstream checkout). It appears here only because
-both patches modify the same file.
+Note: the WITH_ICONV=0 line appears here only because both patches touch the same
+file; it belongs to the iconv-resolution patch (already applied).
 
-Both libxml2.a and libtidy.a must be pre-built (from a prior docker make run)
-before this rebuild. They are preserved in the Docker build cache under
-~/scratch/php-wasm-upstream/lib/lib/.
+--- a/Makefile (the relevant Session 5 addition, on top of Session 2 patch)
++++ b/Makefile
+@@ after EXTRA_FLAGS+= --js-library line (Session 2 addition)
++# php-wasm-async (Session 5): WITH_LIBXML=static leaves PHP_CONFIGURE_DEPS
++# empty (libxml/static.mak only adds to it in dynamic/shared modes). An empty
++# PHP_CONFIGURE_DEPS causes $(MAKE) ${PHP_CONFIGURE_DEPS} to become bare
++# $(MAKE) which targets the default goal → infinite recursion. Seed it with
++# lib/lib/libxml2.a (already built) as a sentinel to keep it non-empty.
++PHP_CONFIGURE_DEPS+= lib/lib/libxml2.a
