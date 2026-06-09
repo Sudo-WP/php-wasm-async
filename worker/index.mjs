@@ -1,44 +1,40 @@
 /**
- * php-wasm-async Session 5: suspend/resume PoC for Cloudflare Workers / workerd.
+ * php-wasm-async Session 6: real async host call — Cloudflare KV read.
  *
- * Imports the Emscripten worker-env glue and the pre-compiled wasm module.
- * Wrangler bundles the .mjs glue and compiles the .wasm at bundle time —
- * the instantiateWasm hook pre-compiles wasm trampolines for Emscripten's
- * GOT.func JS-function stubs (blocked synchronously in workerd), then hands
- * the pre-compiled PHP module to Emscripten via the receive callback.
+ * PHP calls fp_async_call("greeting"), which suspends on env.KV.get("greeting")
+ * and resumes with the stored value. The Worker registers the KV handler per
+ * request via mod.hostAsyncCall; fp_async_call itself stays store-agnostic.
  *
- * Status: PASS — see docs/RESULTS.md Session 5.
- * Asyncify suspend/resume works in workerd: curl http://localhost:8791/ returns
- * "before:\nafter: 42\n". The key insight: WITH_LIBXML=static + pre-compiling
- * the 'vp'-signature trampoline async resolves the MAIN_MODULE init blocker.
- * Six GOT.func symbols (emscripten_console_log/_error/_warn/_trace,
- * emscripten_out, emscripten_err) all require a vp trampoline; the cache is
- * populated once before instantiation and reused for all six.
+ * fp_async_call is now string→string (changed from int→int in Session 5).
+ * Payload is the string key; return is the string value from the handler.
  *
+ * Trampoline fix (Session 5): six Emscripten GOT.func symbols (emscripten_console_*)
+ * all use sig 'vp'; the pre-compiled trampoline-vp.wasm is bundled by wrangler
+ * and loaded via globalThis.__phpWasmTrampolines before PHP instantiation.
+ * apply-workerd-patches.py Patch 3 makes convertJsFunctionToWasm use the cache.
+ *
+ * Status: see docs/RESULTS.md Session 6.
  * Apache-2.0. Our own code; no GPL or LGPL content.
  */
 
 import PHP from './build/php8.0-worker.mjs';
 import phpWasm from './build/php8.0-worker.mjs.wasm';
-// Pre-compiled wasm trampoline for sig 'vp' (void, i32).
-// Wrangler compiles this .wasm at bundle time → WebAssembly.Module.
-// apply-workerd-patches.py Patch 3 makes convertJsFunctionToWasm read from
-// globalThis.__phpWasmTrampolines instead of calling new WebAssembly.Module(bytes),
-// which workerd forbids at runtime. Synchronous new WebAssembly.Instance of a
-// wrangler-bundled module (no new code generation) IS allowed.
+// Pre-compiled wasm trampoline for sig 'vp' (void, i32). Wrangler compiles at
+// bundle time; used by apply-workerd-patches.py Patch 3 to satisfy MAIN_MODULE
+// GOT.func entries without runtime wasm compilation (blocked in workerd).
 import trampolineVP from './build/trampoline-vp.wasm';
 
-// The PoC PHP script — identical to Node V8 Session 3 proof.
+// Session 6 PHP script: fp_async_call with a string key → real KV read.
 const PHP_CODE = `<?php
 echo "before:\n";
-$r = fp_async_call(41);
-echo "after: " . $r . "\n";
+$v = fp_async_call("greeting");
+echo "after: " . $v . "\n";
 `;
 
 export default {
-    async fetch(_request, _env, _ctx) {
+    async fetch(_request, env, _ctx) {
         try {
-            return await runPhp();
+            return await runPhp(env);
         } catch (e) {
             console.error('[worker] error:', e);
             return new Response('Error: ' + String(e) + '\n' + (e?.stack || ''), {
@@ -49,17 +45,11 @@ export default {
     },
 };
 
-async function runPhp() {
+async function runPhp(env) {
     const stdoutBytes = [];
 
-    // Instantiate the Emscripten module, overriding the default wasm
-    // fetch path with the pre-compiled module bundled by wrangler.
     const mod = await PHP({
         instantiateWasm(imports, receive) {
-            // Expose the wrangler-bundled trampoline module for Patch 3 in
-            // apply-workerd-patches.py. No runtime compilation needed — wrangler
-            // pre-compiles trampolineVP at bundle time. Synchronous
-            // new WebAssembly.Instance of a bundled module is allowed in workerd.
             globalThis.__phpWasmTrampolines = new Map([['vp', trampolineVP]]);
             WebAssembly.instantiate(phpWasm, imports).then(
                 instance => receive(instance, phpWasm)
@@ -70,9 +60,12 @@ async function runPhp() {
         stderr: byte => {},
     });
 
-    // Minimal PHP runtime setup (mirrors PhpBase initialization).
-    // pib_storage_init is a no-op without Module.persist; called with
-    // {async: true} because the whole binary is Asyncify-instrumented.
+    // Register the KV-backed handler before running PHP.
+    // fp_async_call will delegate to this function, passing the key string
+    // and receiving the KV value string. No KV-specific code in fp_async_call
+    // or pib.c — the primitive stays store-agnostic (ADR-0016).
+    mod.hostAsyncCall = async (key) => (await env.KV.get(key)) ?? '';
+
     await mod.ccall('pib_storage_init', 'number', [], [], {async: true});
 
     if (!mod.FS.analyzePath('/preload').exists) {
@@ -82,13 +75,8 @@ async function runPhp() {
 
     await mod.ccall('pib_init', 'number', ['string'], ['embed'], {async: true});
 
-    // Ordering marker: this log fires before pib_run is entered.
     console.log('[worker] before: calling pib_run');
 
-    // {async: true} makes ccall return a Promise that Emscripten resolves
-    // after the full Asyncify suspend/resume cycle — identical to the
-    // Session 3 Node V8 proof. Control returns to the event loop between
-    // 'promise registered' and 'timer fired' in fp_async_call.
     await mod.ccall(
         'pib_run',
         'number',
@@ -97,8 +85,6 @@ async function runPhp() {
         {async: true}
     );
 
-    // Ordering marker: this log fires only after fp_async_call has
-    // resolved and pib_run has returned — proving resume happened.
     console.log('[worker] after: pib_run complete');
 
     const output = new TextDecoder().decode(new Uint8Array(stdoutBytes));

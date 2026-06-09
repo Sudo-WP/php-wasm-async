@@ -1,0 +1,135 @@
+diff --git a/source/library_fp_async.js b/source/library_fp_async.js
+new file mode 100644
+index 00000000..058df7d5
+--- /dev/null
++++ b/source/library_fp_async.js
+@@ -0,0 +1,57 @@
++// fp_async_call — the php-wasm-async async host-call bridge import.
++//
++// php-wasm-async, Session 6. Generalizes the Session 3 int→int stub to a
++// generic registered-handler mechanism with string payload and string return.
++//
++// Design rule: this file must stay store-agnostic. It does not know what KV,
++// D1, or R2 are. It delegates to Module.hostAsyncCall, set per-request by the
++// Worker. See DESIGN.md and DECISIONS.md ADR-0016.
++//
++// Handler dispatch:
++//   - If Module.hostAsyncCall is a function, call it with the payload string
++//     and await the result. Used in workerd with a real KV (or other) handler.
++//   - Otherwise, fall back to the old setTimeout(0) stub: parseInt(payload)+1
++//     as a string. This keeps all prior Node V8 regression tests passing
++//     without modification (fp_async_call(41) → "42").
++//
++// String marshalling (Session 6 change from int→int):
++//   - Incoming payload: read via UTF8ToString(payloadPtr) from wasm heap.
++//   - Return value: allocate in wasm heap via stringToNewUTF8(result); the C
++//     side (pib.c PHP_FUNCTION) copies to PHP's heap and calls free().
++//
++// Ordering markers are logged to stderr so the suspend/resume sequence is
++// unambiguous in test output.
++//
++// Apache-2.0, the php-wasm-async authors. Original work, not derived from any
++// GPL source; merged into the Emscripten JS library at link time.
++
++mergeInto(LibraryManager.library, {
++	// char* fp_async_call(const char* payload)
++	fp_async_call__async: true,
++	fp_async_call: function (payloadPtr) {
++		const payload = UTF8ToString(payloadPtr);
++		return Asyncify.handleAsync(async () => {
++			console.error('[fp_async_call] invoked payload=' + payload);
++			let result;
++			if (typeof Module.hostAsyncCall === 'function') {
++				console.error('[fp_async_call] delegating to Module.hostAsyncCall');
++				const value = await Module.hostAsyncCall(payload);
++				result = (value != null) ? String(value) : '';
++			} else {
++				// Fallback stub: keeps Node V8 regression tests working
++				// (fp_async_call(41) → "42"). Not used in workerd when a
++				// real KV handler is registered.
++				result = await new Promise(resolve => {
++					console.error('[fp_async_call] promise registered, returning control to host');
++					setTimeout(() => {
++						const value = String((parseInt(payload, 10) || 0) + 1);
++						console.error('[fp_async_call] timer fired, resolving promise -> ' + value);
++						resolve(value);
++					}, 0);
++				});
++			}
++			console.error('[fp_async_call] wasm resumed, returning ' + result);
++			return stringToNewUTF8(result);
++		});
++	},
++});
+diff --git a/source/pib/pib.c b/source/pib/pib.c
+index ecb82257..323bb9ad 100644
+--- a/source/pib/pib.c
++++ b/source/pib/pib.c
+@@ -38,6 +38,16 @@
+ #define STRINGIFY_INTERNAL(MACRO) #MACRO
+ #define STRINGIFY(MACRO)  STRINGIFY_INTERNAL(MACRO)
+ 
++/*
++ * php-wasm-async (Session 6): generalized to string payload/return.
++ * fp_async_call is implemented in JS (source/library_fp_async.js) and linked
++ * as a WebAssembly import; it is listed in ASYNCIFY_IMPORTS so it is capable
++ * of suspending the PHP stack. The JS side allocates the return string via
++ * stringToNewUTF8 (_malloc); the caller frees it after copying to PHP's heap.
++ * See docs/DECISIONS.md ADR-0016.
++ */
++extern char* fp_async_call(const char* payload);
++
+ int main(void) { return 0; }
+ 
+ bool started = false;
+@@ -283,6 +293,41 @@ char* EMSCRIPTEN_KEEPALIVE pib_tokenize(char *code)
+ 	ZEND_PARSE_PARAMETERS_END()
+ #endif
+ 
++/*
++ * php-wasm-async (Session 6): expose fp_async_call to PHP userspace as
++ * fp_async_call(string $payload): string. The JS side allocates the return
++ * string with stringToNewUTF8; we copy it into PHP's heap and free the
++ * wasm-heap allocation. Non-strict PHP type coercion means integer literals
++ * still work (41 → "41"), preserving existing Node V8 regression tests.
++ * See docs/DECISIONS.md ADR-0016.
++ */
++ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_fp_async_call, 0, 1, IS_STRING, 0)
++	ZEND_ARG_TYPE_INFO(0, payload, IS_STRING, 0)
++ZEND_END_ARG_INFO()
++
++PHP_FUNCTION(fp_async_call)
++{
++	char *payload;
++	size_t payload_len;
++
++	ZEND_PARSE_PARAMETERS_START(1, 1)
++		Z_PARAM_STRING(payload, payload_len)
++	ZEND_PARSE_PARAMETERS_END();
++
++	char *result = fp_async_call(payload);
++	if (result != NULL) {
++		RETVAL_STRING(result);
++		free(result);
++	} else {
++		RETURN_EMPTY_STRING();
++	}
++}
++
++static const zend_function_entry pib_functions[] = {
++	PHP_FE(fp_async_call, arginfo_fp_async_call)
++	PHP_FE_END
++};
++
+ PHP_RINIT_FUNCTION(pib)
+ {
+ 	return SUCCESS;
+@@ -306,7 +351,7 @@ PHP_MINFO_FUNCTION(pib)
+ zend_module_entry pib_module_entry = {
+ 	STANDARD_MODULE_HEADER,
+ 	"pib",
+-	NULL,                    /* zend_function_entry */
++	pib_functions,           /* zend_function_entry (php-wasm-async: fp_async_call) */
+ 	PHP_MINIT(pib),          /* PHP_MINIT - Module initialization */
+ 	NULL,                    /* PHP_MSHUTDOWN - Module shutdown */
+ 	PHP_RINIT(pib),          /* PHP_RINIT - Request initialization */

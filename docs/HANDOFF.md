@@ -25,15 +25,26 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Session 5 PASS (2026-06-09). Asyncify suspend/resume confirmed inside
-workerd. The ADR-0005 success criterion is satisfied end-to-end (Node V8 + workerd).
-ADR-0006 fully satisfied. The Asyncify PoC is complete.
+**Phase:** Session 6 PASS (2026-06-09). Real async host call demonstrated: PHP suspends
+on `env.KV.get("greeting")` and resumes with the stored value in workerd. The generic
+`fp_async_call` primitive dispatches to a registered `Module.hostAsyncCall` handler set
+per-request by the Worker; KV is the first real consumer of the store-agnostic primitive.
 
-**Session 5 result.** `curl http://localhost:8791/` returns `before:\nafter: 42\n`.
-The Asyncify suspend/resume ordering markers confirm the full cycle ran inside workerd.
-Two consecutive requests both succeeded.
+**Session 6 result.** `curl http://localhost:8791/` returns `before:\nafter: hello from KV\n`.
+The ordering markers confirm: `[fp_async_call] delegating to Module.hostAsyncCall` (suspend)
+→ KV Promise resolves → `[fp_async_call] wasm resumed` (resume). Two consecutive requests both
+succeeded. Node V8: all three tests pass (regression, session3 stub fallback, session6 handler).
 
-**Session 5 approach (ADR-0014 + ADR-0015).**
+**Session 6 changes (on top of Session 5):**
+- `fp_async_call` is now `string → string` (was `int → int`). Payload: UTF-8 key string.
+  Return: `stringToNewUTF8`-allocated value, copied to PHP heap and freed by `pib.c`.
+- `Module.hostAsyncCall` dispatch: if the property is a function, `fp_async_call` delegates
+  and returns the handler's resolved string. Fallback: old stub (parseInt(payload)+1 as string)
+  keeps all prior Node V8 tests passing.
+- `wrangler.toml` KV binding (`KV`); `worker/index.mjs` registers the KV handler per request.
+- Seed: `wrangler kv key put --binding=KV "greeting" "hello from KV" --local --preview false`.
+
+**Session 5 approach (ADR-0014 + ADR-0015, unchanged in Session 6).**
 - `WITH_LIBXML=static` + `WITH_TIDY=static` in `.circleci/.env_8.0.ci` — switches
   libxml2 and libtidy from dynamic WASM side modules to static archives. Eliminates
   the 4 libxml2 GOT symbols that triggered the Session 4 blocker.
@@ -45,14 +56,20 @@ Two consecutive requests both succeeded.
   pre-compiled cache rather than `new WebAssembly.Module(bytes)`.
 
 **Session 5 committed files (on top of Session 4):**
-- `worker/index.mjs` — updated: imports `trampoline-vp.wasm`, sets
-  `globalThis.__phpWasmTrampolines` in `instantiateWasm`
+- `worker/index.mjs` — trampoline import + cache setup
 - `worker/build/trampoline-vp.wasm` — 31-byte bundled vp-signature trampoline
 - `worker/apply-workerd-patches.py` — Patch 3 added
 - `patches/session5-static-libxml.patch` — env + Makefile changes for static build
 - `docs/DECISIONS.md` — ADR-0014 (pre-session) + ADR-0015 (result)
 
+**Session 6 committed files (on top of Session 5):**
+- `worker/index.mjs` — KV handler registration, `env` parameter, string PHP script
+- `wrangler.toml` — KV namespace binding
+- `patches/session6-real-async.patch` — pib.c string ABI + library_fp_async.js handler
+- `docs/DECISIONS.md` — ADR-0016
+
 **What all sessions established (all true):**
+- Session 6 PASS: real async host call — PHP suspends on `env.KV.get()`, resumes with stored value.
 - Session 5 PASS: Asyncify suspend/resume in workerd — `before:\nafter: 42\n`.
 - Session 3 PASS: Asyncify suspend/resume in Node V8 — `before:\nafter: 42\n`.
 - Session 2: `fp_async_call` import added; PHP calls it; binary size delta +1,257 B raw.
@@ -96,9 +113,15 @@ Source deltas for Sessions 2–5 are committed as patches.
    bundled by wrangler) resolves the 6 Emscripten console GOT.func symbols.
    `curl http://localhost:8791/` → `before:\nafter: 42\n` — PASS (2026-06-09).
 
+6. **[DONE] Real async host call.** `fp_async_call` generalized to registered handler
+   with string payload/return. First real consumer: `env.KV.get("greeting")`. Worker
+   registers handler per request (`mod.hostAsyncCall = async key => env.KV.get(key)`);
+   primitive stays store-agnostic. `curl http://localhost:8791/` → `before:\nafter: hello from KV\n`
+   — PASS (2026-06-09). Node V8: regression + stub fallback + handler — all PASS.
+
 **The PoC is complete.** The ADR-0005 success criterion is satisfied in workerd.
 ADR-0006 is fully satisfied. The Asyncify suspend/resume primitive is proven in
-both Node V8 and Cloudflare Workers / workerd.
+both Node V8 and Cloudflare Workers / workerd, against a real async host operation.
 
 ---
 
@@ -129,10 +152,11 @@ both Node V8 and Cloudflare Workers / workerd.
 
 ## Next action
 
-**Session 5 PASS.** The Asyncify PoC is complete. `before:\nafter: 42\n` from
-workerd (2026-06-09).
+**Session 6 PASS.** Real async host call demonstrated: PHP suspends on a genuine
+`env.KV.get()` and resumes with the stored value, in workerd (2026-06-09).
+The generic `fp_async_call` primitive remains store-agnostic.
 
-**Potential next sessions (optional — the PoC objective is met):**
+**Potential next sessions (optional — the PoC + productization demo is complete):**
 
 1. **JSPI port (optimization).** Rebuild with JSPI + `WITH_LIBXML=static` to get a
    smaller binary (drops Asyncify instrumentation) and lower per-call overhead. The
@@ -140,8 +164,9 @@ workerd (2026-06-09).
    sizes and latency in RESULTS.md. Use `WebAssembly.Suspending`/`WebAssembly.promising`
    in `worker/index.mjs` instead of `ccall({async: true})`.
 
-2. **Real async host call.** Replace the `setTimeout(0)` stub with an actual async
-   operation (KV read, D1 query, R2 fetch) to demonstrate the real-world pattern.
+2. **Additional store consumers.** Wire D1 (SQL), R2 (object storage), or Durable Objects
+   as additional consumers of `fp_async_call`. The primitive is already generic; each
+   consumer is a one-line `mod.hostAsyncCall` registration in the Worker. No rebuild needed.
 
 3. **PHP version bump.** Port to PHP 8.3 or 8.4 (end-of-life 8.0 replaced with a
    supported branch). The build structure is the same; only the version string and

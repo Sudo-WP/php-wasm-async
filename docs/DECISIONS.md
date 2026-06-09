@@ -10,6 +10,69 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0016 — Session 6: generalize fp_async_call to a registered string handler; KV as first real consumer
+**Date:** 2026-06-09 · **Status:** Accepted
+
+**Decision.** Generalize `fp_async_call` from a hardcoded `int → int` stub to a generic
+registered-handler mechanism with `string → string` payload and return type. The first
+real consumer is a Cloudflare KV read — demonstrating PHP suspending on a genuine async
+host operation and resuming with the actual stored value.
+
+**The generic-primitive rule (invariant — must not be violated by this or future sessions).**
+`fp_async_call` must remain **store-agnostic**. It does not know what KV, D1, or R2 are.
+The host-side handler is registered per-request by the Worker; `fp_async_call`/`pib.c`
+contain no store-specific code. KV is the first *consumer* of the generic primitive, not
+a dependency baked into it. This principle is stated in `DESIGN.md` and must be enforced
+at every session boundary.
+
+**Changes in this decision.**
+
+1. **String payload and return (`pib.c`, `library_fp_async.js`).** The `int` payload/return
+   of Sessions 1–5 was a minimal PoC convenience. Real host operations pass keys (strings)
+   and return values (strings). This session changes the C extern declaration, the PHP
+   function arginfo, and the JS library to use `char*` (UTF-8 string pointers in the wasm
+   heap):
+   - `extern char* fp_async_call(const char* payload)` — the JS library allocates the
+     return string via `stringToNewUTF8`; C calls `free()` after copying to PHP's heap.
+   - `PHP_FUNCTION(fp_async_call)` — accepts `IS_STRING`, returns `IS_STRING`. PHP type
+     coercion (non-strict mode) means passing an integer literal still works; existing
+     tests pass without modification.
+
+2. **Registered handler (`Module.hostAsyncCall`).** The JS library reads
+   `Module.hostAsyncCall` at call time. If set, it delegates to it and awaits the result.
+   If unset, it falls back to the old `setTimeout(0)` stub returning `String(parseInt(payload)+1)` — identical behavior for all prior Node V8 tests. The Worker registers
+   the handler on the module instance before running PHP:
+   ```js
+   mod.hostAsyncCall = async (key) => (await env.KV.get(key)) ?? '';
+   ```
+   `Module` inside the JS library refers to the Emscripten module instance (`mod`), so
+   the property is set on the same object.
+
+3. **KV binding (`wrangler.toml`, `worker/index.mjs`).** A `[[kv_namespaces]]` entry with
+   `binding = "KV"` is added to `wrangler.toml`. For `wrangler dev --local`, miniflare
+   provides the KV store with no Cloudflare credentials. The seed key
+   `greeting → hello from KV` is put via the wrangler CLI once; it is not hardcoded in
+   the worker. The PHP script changes to `fp_async_call("greeting")`.
+
+**Rebuild required.** Changing `pib.c` forces the ext re-copy, reconfigure, recompile, and
+relink — same shape as Session 2. The rebuild uses the same toolchain and
+`WITH_LIBXML=static`/`WITH_TIDY=static` config as Session 5. No new binary-level changes are
+expected beyond the `fp_async_call` ABI change (int → pointer pair).
+
+**Success criterion.** PHP suspends on a genuine `env.KV.get("greeting")` (a real Promise,
+unresolved at call time) and resumes with the actual stored value, in workerd, producing
+`before:\nafter: hello from KV\n`. The primitive remains store-agnostic.
+
+**Alternatives considered.**
+- Keep `int` payload and encode keys/values as integers: rejected — not a real demo and
+  adds an encoding layer that obscures the KV usage.
+- Pass raw opaque bytes (`void*`/ArrayBuffer): more general but over-engineered for the PoC;
+  UTF-8 strings are the natural type for KV keys and string values.
+- Hardcode KV calls in `library_fp_async.js`: explicitly rejected — violates the generic-
+  primitive rule in `DESIGN.md`.
+
+---
+
 ## ADR-0015 — Session 5 PASS: Asyncify works in workerd with static libxml + pre-compiled trampoline
 **Date:** 2026-06-09 · **Status:** Accepted · **Supersedes:** ADR-0012, ADR-0013 (prescription); **Corrects (in part):** ADR-0014
 

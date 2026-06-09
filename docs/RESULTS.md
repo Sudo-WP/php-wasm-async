@@ -3,9 +3,9 @@
 Benchmarks and findings — what works, what does not, with evidence.
 Negative results are first-class and are recorded here, not glossed over.
 
-> **Status: Session 5 PASS (2026-06-09).** Asyncify suspend/resume confirmed in
-> workerd. `curl http://localhost:8791/` → `before:\nafter: 42\n`. The ADR-0005
-> success criterion is satisfied end-to-end. See Session 5 result section below.
+> **Status: Session 6 PASS (2026-06-09).** Real async host call demonstrated in workerd:
+> PHP suspends on `env.KV.get("greeting")` and resumes with the stored value.
+> `curl http://localhost:8791/` → `before:\nafter: hello from KV\n`. See Session 6 result below.
 
 ---
 
@@ -428,6 +428,127 @@ The +3.65 MiB wasm increase is libxml2 + libtidy statically linked. Compresses w
 - `worker/apply-workerd-patches.py` — Patch 3 added (cache-backed `convertJsFunctionToWasm`)
 - `patches/session5-static-libxml.patch` — env + Makefile changes for static build
 - `docs/DECISIONS.md` — ADR-0014 (pre-session) + ADR-0015 (result)
+
+---
+
+## Session 6 — real async host call: PASS (2026-06-09)
+
+**PASS.** PHP suspends on a genuine `env.KV.get("greeting")` (a real Promise, unresolved at
+call time) and resumes with the stored value, in workerd. The primitive remains store-agnostic:
+`fp_async_call` and `pib.c` contain no KV-specific code.
+
+### Success criterion result
+
+```
+$ curl http://localhost:8791/
+before:
+after: hello from KV
+```
+
+Two consecutive requests both returned `before:\nafter: hello from KV\n`.
+
+### Host-side ordering (wrangler console)
+
+```
+[worker] before: calling pib_run
+[fp_async_call] invoked payload=greeting
+[fp_async_call] delegating to Module.hostAsyncCall
+[fp_async_call] wasm resumed, returning hello from KV
+[worker] after: pib_run complete
+```
+
+`before: calling pib_run` fires before PHP runs; `delegating to Module.hostAsyncCall` marks
+the Asyncify suspend into the event loop (the KV Promise is unresolved at this point);
+`wasm resumed, returning hello from KV` marks the resume after the KV read resolved.
+`after: pib_run complete` fires only after PHP returned.
+
+### What changed from Session 5
+
+1. **`library_fp_async.js` — string marshalling + handler dispatch.** Payload is now read
+   as a UTF-8 string via `UTF8ToString(payloadPtr)`. Return is allocated in the wasm heap
+   via `stringToNewUTF8(result)` (calls `_malloc`; C side copies to PHP heap, then `free()`s).
+   Handler dispatch: if `Module.hostAsyncCall` is a function, call it and await the result;
+   otherwise fall back to the old `setTimeout(0)` stub, preserving all prior Node V8 tests.
+
+2. **`source/pib/pib.c` — string ABI.** `extern char* fp_async_call(const char* payload)`.
+   `PHP_FUNCTION(fp_async_call)`: arginfo changed to `IS_STRING`; `Z_PARAM_STRING` extracts
+   the payload string; `RETVAL_STRING(result)` + `free(result)` copies the wasm-heap string
+   to PHP's heap and frees the wasm allocation.
+
+3. **`worker/index.mjs` — handler registration.** Before running PHP:
+   ```js
+   mod.hostAsyncCall = async (key) => (await env.KV.get(key)) ?? '';
+   ```
+   `mod` is the Emscripten module instance returned by `await PHP({...})`, which is the same
+   object as `Module` inside `library_fp_async.js`. Setting `hostAsyncCall` here makes it
+   visible to `fp_async_call` at PHP call time.
+
+4. **`wrangler.toml` — KV binding.**
+   ```toml
+   [[kv_namespaces]]
+   binding = "KV"
+   id = "local-dev-only"
+   preview_id = "local-dev-only"
+   ```
+   Local miniflare KV, no Cloudflare credentials needed. Seed command:
+   `wrangler kv key put --binding=KV "greeting" "hello from KV" --local --preview false`
+
+### Node V8 results (Session 6 binary)
+
+All three Node tests pass on the rebuilt binary:
+
+```
+$ node test-regression.mjs
+hello: "hello\n"
+version: "8.0.30"
+RESULT: PASS
+
+$ node test-session3.mjs
+[fp_async_call] invoked payload=41
+[fp_async_call] promise registered, returning control to host
+[fp_async_call] timer fired, resolving promise -> 42
+[fp_async_call] wasm resumed, returning 42
+stdout (run 1): "before:\nafter: 42\n"
+stdout (run 2): "before:\nafter: 42\n"
+RESULT: PASS
+
+$ node test-session6.mjs
+Test 1: registered handler (async key => "hello from KV")
+[fp_async_call] invoked payload=greeting
+[fp_async_call] delegating to Module.hostAsyncCall
+[fp_async_call] wasm resumed, returning hello from KV
+stdout: "before:\nafter: hello from KV\n"
+RESULT: PASS
+Test 2: stub fallback (fp_async_call(41) -> "42")
+stdout: "before:\nafter: 42\n"
+RESULT: PASS
+```
+
+The stub fallback (integer 41 → "42") confirms non-strict PHP coercion: passing an integer
+to the `IS_STRING` parameter silently coerces 41 → "41", and the fallback returns "42".
+All prior tests pass without modification.
+
+### Binary sizes (Session 6)
+
+| Artifact | Session 5 | Session 6 | Delta |
+|---|---|---|---|
+| `php8.0-worker.mjs.wasm` raw | 15,831,979 B | 15,832,594 B | **+615 B** |
+| `php8.0-worker.mjs` glue raw | 309,714 B | 310,000 B | **+286 B** |
+| `php8.0-node.mjs.wasm` raw | 12,183,180 B | 15,832,594 B | +3.65 MB* |
+| `trampoline-vp.wasm` | 31 B | 31 B | 0 |
+
+*`php8.0-node.mjs` was rebuilt for Session 6 (needed for Node handler test). It now uses
+`WITH_LIBXML=static` (the `.env_8.0.ci` patch from Session 5), matching the worker binary.
+The +615 B wasm delta is the new `fp_async_call` string-marshalling code.
+
+### Session 6 committed files
+
+- `source/library_fp_async.js` (in upstream patch) — handler dispatch + string marshalling
+- `source/pib/pib.c` (in upstream patch) — string ABI for `fp_async_call`
+- `worker/index.mjs` — updated: KV handler registration, `env` parameter, string PHP script
+- `wrangler.toml` — KV namespace binding added
+- `patches/session6-real-async.patch` — full diff (pib.c + library_fp_async.js)
+- `docs/DECISIONS.md` — ADR-0016
 
 ---
 

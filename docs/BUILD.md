@@ -417,6 +417,81 @@ of a pre-compiled bundled module IS allowed in workerd (instantiation, not compi
 Runtime compilation (`new WebAssembly.Module(bytes)` and `WebAssembly.compile(bytes)`)
 are both blocked; only bundle-time AOT compilation works.
 
+### Session 6 — real async host call + string marshalling (validated 2026-06-09)
+
+**Goal:** replace the `setTimeout(0)`/int stub with a registered `Module.hostAsyncCall`
+handler backed by Cloudflare KV. Changes `fp_async_call` to `string → string`.
+
+**Part 1: Rebuild both node-mjs and worker-mjs.**
+
+`pib.c` changes (string arginfo) force the ext re-copy, reconfigure, recompile, and
+relink — same mechanism as Session 2. Apply the session6 patch on top of sessions 2,
+3, iconv-resolution, and session5:
+
+```bash
+cd ~/scratch/php-wasm-upstream
+# Apply session6 patch (if working from a clean checkout with earlier patches applied)
+git apply ~/php-wasm-async/patches/session6-real-async.patch
+
+# Rebuild worker binary (the prod target for workerd)
+make PHP_VERSION=8.0 ENV_FILE=.circleci/.env_8.0.ci worker-mjs
+
+# Rebuild node binary (needed for Node V8 regression + handler tests)
+make PHP_VERSION=8.0 ENV_FILE=.circleci/.env_8.0.ci node-mjs
+```
+
+The session6 patch changes two files:
+1. `source/library_fp_async.js` — string payload (UTF8ToString), registered handler
+   dispatch (`Module.hostAsyncCall`), stub fallback, string return (`stringToNewUTF8`).
+2. `source/pib/pib.c` — `extern char* fp_async_call(const char* payload)`;
+   `PHP_FUNCTION` arginfo changed to `IS_STRING`; `Z_PARAM_STRING` + `RETVAL_STRING`
+   + `free(result)` pattern (JS side allocates with `stringToNewUTF8` / `_malloc`;
+   C side copies to PHP heap via `RETVAL_STRING` then frees the wasm allocation).
+
+**Note on node-mjs binary size**: the `node-mjs` target now uses `WITH_LIBXML=static`
+(from the session5 patch applied to `.env_8.0.ci`), so `php8.0-node.mjs.wasm` is now
+~15.8 MB, same as the worker binary. This is expected.
+
+**Part 2: Verify Node V8 (regression + new handler test).**
+
+```bash
+cd ~/scratch/php-wasm-upstream
+node test-regression.mjs    # hello/"8.0.30" — PASS
+node test-session3.mjs      # before:/after: 42 (stub fallback) — PASS
+node test-session6.mjs      # before:/after: hello from KV (handler) — PASS
+```
+
+`test-session6.mjs` sets `phpModule.hostAsyncCall = async (key) => "hello from KV"`
+on the resolved `php.binary` module instance before calling `php.run()`. This proves
+string marshalling and handler dispatch work in isolation from workerd.
+
+**Part 3: Copy artifacts, apply workerd patches, seed KV, verify in workerd.**
+
+```bash
+# Copy both artifacts to worker/build/ (gitignored)
+cp ~/scratch/php-wasm-upstream/packages/php-wasm/php8.0-worker.mjs \
+   ~/scratch/php-wasm-upstream/packages/php-wasm/php8.0-worker.mjs.wasm \
+   ~/php-wasm-async/worker/build/
+
+# Apply all four workerd glue patches (idempotent)
+python3 ~/php-wasm-async/worker/apply-workerd-patches.py
+
+# Seed the KV key once (miniflare local store; needs --preview false because
+# wrangler.toml has both id and preview_id set)
+cd ~/php-wasm-async
+wrangler kv key put --binding=KV "greeting" "hello from KV" --local --preview false
+
+# Start wrangler dev and curl
+wrangler dev --local --port 8791 &
+sleep 6
+curl http://localhost:8791/
+# Expected: before:\nafter: hello from KV\n
+```
+
+The KV seeding must be done once after any `wrangler` state reset. The seeded value
+persists across `wrangler dev` restarts. Do not hardcode the value in the worker —
+keep the KV read on the real async path.
+
 ## Known fragile steps
 
 - **Exhaustive suspendable-imports list.** *Not a problem on this pipeline*
