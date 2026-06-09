@@ -10,8 +10,63 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0014 — Session 5 reframing: the blocker is dynamic linking, not Asyncify; change one variable
+**Date:** 2026-06-09 · **Status:** Accepted · **Supersedes (in part):** ADR-0012, ADR-0013
+
+**Reframing.** ADR-0012 concluded "Asyncify+MAIN_MODULE binary incompatible with workerd" and
+ADR-0013 concluded "switch to JSPI." This was premature: the Session 4 failure happened in the
+*init path* (`xmlInitParser()` → `loadDylibs` → `reportUndefinedSymbols`), before Asyncify
+suspension machinery was ever reached. Asyncify-in-workerd was never tested — only the
+dynamic-linking init path was tested. The two issues are independent:
+
+1. **Dynamic-linking init blocker** — `MAIN_MODULE=1 → loadDylibs → reportUndefinedSymbols →
+   addFunction → convertJsFunctionToWasm → new WebAssembly.Module(bytes)` is blocked by workerd.
+   This fires because four libxml2 symbols (`xmlStrdup`, `xmlStrncmp`, `xmlURIUnescapeString`,
+   `xmlUnlinkNode`) are undefined in the main wasm binary under `WITH_LIBXML=dynamic`.
+2. **Asyncify suspension in workerd** — completely untested. May work fine.
+
+Combining both changes (linking fix + JSPI switch) in one session conflates two independent
+variables. Good experimental practice requires changing one at a time.
+
+**Decision.** Session 5 changes **one variable**: fix the linking blocker by switching
+`WITH_LIBXML=static` (detailed below), keeping Asyncify. If Asyncify suspension then
+works in workerd, the PoC is complete. Only if Asyncify suspension genuinely fails in
+workerd does Session 6 address JSPI.
+
+ADR-0013's finding (JSPI is confirmed available in workerd) remains valid and useful;
+only its prescription ("use JSPI for workerd") is premature pending the Session 5 result.
+
+**The surgical fix: `WITH_LIBXML=static`.**
+
+The pipeline's `packages/libxml/static.mak` has three relevant modes:
+- `dynamic` (current, `WITH_LIBXML=1`): libxml2 is a dynamic side module (`DYNAMIC_LIBS_GROUPED+= xml-libs`). libxml2.a is NOT in `ARCHIVES`. GOT entries for libxml2 symbols are zero (undefined) → `reportUndefinedSymbols` → `addFunction` → BLOCKED.
+- `static` (chosen): `ARCHIVES+= lib/lib/libxml2.a`, `DYNAMIC_LIBS_GROUPED` NOT updated. All libxml2 symbols statically linked; GOT entries non-zero → `reportUndefinedSymbols` finds nothing → `addFunction` never fires → no WebAssembly.Module(bytes) call → unblocked.
+- `0` (`--disable-libxml`): drops ext/libxml, ext/dom, ext/simplexml, ext/xml, ext/xmlreader, ext/xmlwriter, ext/soap — unacceptable capability loss for a PoC targeting WordPress-like workloads.
+
+`WITH_LIBXML=static` keeps `MAIN_MODULE=1`, keeps Asyncify, keeps full PHP XML capabilities,
+and eliminates exactly the four undefined symbols causing the init blocker. Binary size
+increases by approximately the size of libxml2.a (~1–2 MB raw); functional behavior is identical.
+
+**What this supersedes in ADR-0012.**
+The framing "Asyncify+MAIN_MODULE binary incompatible with workerd" is overstated. The correct
+framing is "Asyncify+MAIN_MODULE+WITH_LIBXML=dynamic binary incompatible with workerd because
+LIBXML_DYNAMIC_LOAD=1 leaves four libxml2 symbols undefined in the GOT." MAIN_MODULE=1 is not
+the direct cause; the undefined symbols are.
+
+**What this supersedes in ADR-0013.**
+The prescription "JSPI is the designated path for the workerd integration" is deferred pending
+the Session 5 result. If Asyncify suspension works in workerd after the linking fix, ADR-0002
+(Asyncify first, JSPI as optimization) stands unchanged. If Asyncify suspension fails in workerd
+for a genuine mechanism reason (not a linking issue), that is the trigger for JSPI (Session 6).
+
+**Alternatives considered (linking fix).**
+- `MAIN_MODULE=0` — drops the dynamic linking infrastructure entirely; loadDylibs/reportUndefinedSymbols never run. More comprehensive but breaks side-module loading (other extensions use it). Rejected as over-broad; WITH_LIBXML=static is more surgical.
+- `--disable-libxml` — removes ext/libxml and the four symbols. Works, but drops capabilities needed for the eventual WordPress target. Acceptable only as a last resort.
+
+---
+
 ## ADR-0013 — JSPI confirmed available in workerd; designated path for workerd integration
-**Date:** 2026-06-08 · **Status:** Accepted · **Depends on:** ADR-0012
+**Date:** 2026-06-08 · **Status:** Accepted (JSPI availability finding); prescription deferred pending Session 5 Asyncify result — see ADR-0014 · **Depends on:** ADR-0012
 
 **Decision.** JSPI (JavaScript-Promise Integration) is the designated mechanism for
 the workerd integration. Session 4 probe confirmed that workerd (wrangler 4.96.0,

@@ -1,0 +1,72 @@
+This patch changes WITH_LIBXML from dynamic (the upstream default, `WITH_LIBXML=1`)
+to static (`WITH_LIBXML=static`), and WITH_TIDY from dynamic (`WITH_TIDY=1`) to
+static (`WITH_TIDY=static`). This is the Session 5 surgical linking fix.
+
+Background (see DECISIONS.md ADR-0014):
+Session 4 was blocked by the following init-path failure in workerd:
+  receiveInstance → loadDylibs → reportUndefinedSymbols → addFunction
+  → convertJsFunctionToWasm → new WebAssembly.Module(bytes) → BLOCKED
+
+The root cause is that WITH_LIBXML=dynamic (the upstream default) leaves four
+libxml2 symbols undefined in the main wasm binary's GOT:
+  xmlStrdup, xmlStrncmp, xmlURIUnescapeString, xmlUnlinkNode
+
+These are referenced by ext/libxml MINIT → xmlInitParser(), which fires during
+php_embed_init('embed'). In dynamic mode, libxml2 is a WASM side module
+(DYNAMIC_LIBS_GROUPED+= xml-libs, LIBXML_DYNAMIC_LOAD=1). The symbols are
+expected to come from the side module at runtime, not from the main binary.
+
+In workerd, the stub-creation path (addFunction → convertJsFunctionToWasm) is
+blocked because workerd disallows runtime WebAssembly.Module() compilation and
+lacks WebAssembly.Function. No JS-level workaround is possible.
+
+Fix: WITH_LIBXML=static adds lib/lib/libxml2.a to ARCHIVES (statically linked into
+the main binary) and does NOT add xml-libs to DYNAMIC_LIBS_GROUPED. The four
+undefined symbols are resolved at link time. reportUndefinedSymbols finds nothing
+undefined in the GOT → addFunction is never called → no blocked wasm compilation.
+
+WITH_TIDY=static is required because WITH_TIDY=dynamic requires WITH_LIBXML=dynamic
+(enforced by php-wasm-tidy/static.mak). Changing to static links libtidy.a into
+the main binary as well.
+
+Changes vs. the upstream baseline (on top of sessions 2, 3, iconv-resolution):
+- WITH_LIBXML=1 → WITH_LIBXML=static in .circleci/.env_8.0.ci
+- WITH_TIDY=1  → WITH_TIDY=static  in .circleci/.env_8.0.ci
+- WITH_ICONV=1 → WITH_ICONV=0 (iconv-resolution patch, already applied)
+
+Apply order:
+  1. patches/session2-fp_async_call.patch
+  2. patches/session3-suspend.patch
+  3. patches/iconv-resolution.patch
+  4. patches/session5-static-libxml.patch  ← this file (git apply from upstream root)
+
+--- a/.circleci/.env_8.0.ci
++++ b/.circleci/.env_8.0.ci
+@@ -14,13 +14,13 @@ WITH_MBSTRING=1
+ WITH_PHAR=1
+ WITH_TOKENIZER=1
+
+-WITH_LIBXML=1
++WITH_LIBXML=static
+ WITH_DOM=1
+ WITH_XML=1
+ WITH_SIMPLEXML=1
+
+ WITH_LIBZIP=1
+-WITH_ICONV=1
++WITH_ICONV=0
+ WITH_SQLITE=1
+
+@@ -39,7 +39,7 @@ WITH_GD=1
+ WITH_ZLIB=1
+
+-WITH_TIDY=1
++WITH_TIDY=static
+
+Note: the WITH_ICONV=0 line above belongs to the iconv-resolution patch
+(already applied in the upstream checkout). It appears here only because
+both patches modify the same file.
+
+Both libxml2.a and libtidy.a must be pre-built (from a prior docker make run)
+before this rebuild. They are preserved in the Docker build cache under
+~/scratch/php-wasm-upstream/lib/lib/.
