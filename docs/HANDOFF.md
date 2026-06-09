@@ -25,52 +25,52 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Session 4 BLOCKED (2026-06-08). The Asyncify binary cannot initialize
-inside workerd. Session 3 PoC PASS (Node V8) stands and is the permanent evidence
-that the Asyncify primitive works. Session 5 will target workerd via JSPI with a
-new binary.
+**Phase:** Session 5 PASS (2026-06-09). Asyncify suspend/resume confirmed inside
+workerd. The ADR-0005 success criterion is satisfied end-to-end (Node V8 + workerd).
+ADR-0006 fully satisfied. The Asyncify PoC is complete.
 
-**Session 4 summary.** Attempted to wire the Session 3 `php8.0-worker.mjs` binary
-into a Cloudflare Worker via `wrangler dev`. Three glue patches required:
+**Session 5 result.** `curl http://localhost:8791/` returns `before:\nafter: 42\n`.
+The Asyncify suspend/resume ordering markers confirm the full cycle ran inside workerd.
+Two consecutive requests both succeeded.
 
-1. `self.location.href` guard — required for workerd ESM format; WORKS.
-2. `addEventListener useCapture=false` — required (workerd forbids `true`); WORKS.
-3. `addFunction/convertJsFunctionToWasm` — **HARD BLOCKER** (ADR-0012). workerd
-   blocks `new WebAssembly.Module(bytes)` at runtime and lacks `WebAssembly.Function`.
-   The four undefined libxml2 symbols (`xmlStrdup`, `xmlStrncmp`, `xmlURIUnescapeString`,
-   `xmlUnlinkNode`) needed for `xmlInitParser()` during `php_embed_init` cannot be
-   stubbed. No JS-level fix exists; a build change is required.
+**Session 5 approach (ADR-0014 + ADR-0015).**
+- `WITH_LIBXML=static` + `WITH_TIDY=static` in `.circleci/.env_8.0.ci` — switches
+  libxml2 and libtidy from dynamic WASM side modules to static archives. Eliminates
+  the 4 libxml2 GOT symbols that triggered the Session 4 blocker.
+- Pre-compiled `vp` trampoline (`worker/build/trampoline-vp.wasm`, 31 bytes, committed
+  and bundled by wrangler) — resolves 6 Emscripten console/output GOT.func symbols
+  that ALSO trigger `addFunction → convertJsFunctionToWasm`. workerd blocks ALL runtime
+  wasm compilation (sync and async); only wrangler-bundled (AOT-compiled) modules work.
+- `apply-workerd-patches.py` Patch 3 — patches `convertJsFunctionToWasm` to use the
+  pre-compiled cache rather than `new WebAssembly.Module(bytes)`.
 
-**JSPI confirmed in workerd (ADR-0013, 2026-06-08).** Probe confirmed:
-`WebAssembly.Suspending`, `WebAssembly.promising`, `WebAssembly.SuspendError` are
-present in workerd (wrangler 4.96.0, compatibility date 2024-09-23).
-`WebAssembly.Function` is NOT present.
+**Session 5 committed files (on top of Session 4):**
+- `worker/index.mjs` — updated: imports `trampoline-vp.wasm`, sets
+  `globalThis.__phpWasmTrampolines` in `instantiateWasm`
+- `worker/build/trampoline-vp.wasm` — 31-byte bundled vp-signature trampoline
+- `worker/apply-workerd-patches.py` — Patch 3 added
+- `patches/session5-static-libxml.patch` — env + Makefile changes for static build
+- `docs/DECISIONS.md` — ADR-0014 (pre-session) + ADR-0015 (result)
 
-**Session 4 committed files:**
-- `worker/index.mjs` — workerd loader entry (blocked, status in file comment)
-- `wrangler.toml` — wrangler config
-- `patches/session4-workerd-analysis.patch` — full three-patch analysis with evidence
-
-**What all prior sessions established (still true):**
-- Session 3 PASS: PHP suspends on an unresolved Promise and resumes with `42`.
-  Ordering markers confirm the Asyncify suspend/resume cycle. ADR-0006 satisfied.
+**What all sessions established (all true):**
+- Session 5 PASS: Asyncify suspend/resume in workerd — `before:\nafter: 42\n`.
+- Session 3 PASS: Asyncify suspend/resume in Node V8 — `before:\nafter: 42\n`.
 - Session 2: `fp_async_call` import added; PHP calls it; binary size delta +1,257 B raw.
 - Session 1: unmodified PHP 8.0.30 from source; runs synchronously in Node V8.
-- iconv-resolution: GNU libiconv dropped (`WITH_ICONV=0`); binary byte-identical;
-  no LGPL in binary or distribution (ADR-0011).
+- iconv-resolution: GNU libiconv dropped (`WITH_ICONV=0`); no LGPL in binary (ADR-0011).
 
 **Decided** (see `DECISIONS.md` for full reasoning):
 - License: **Apache-2.0**, clean-derivation path.
 - Lineage: derive from the **Apache-2.0** ancestor pipeline, not GPL Playground packages.
-- Suspension mechanism: **Asyncify first** (proven in Node V8); **JSPI** for workerd
-  integration (accelerated from planned Session 5 optimization — ADR-0013).
+- Suspension mechanism: **Asyncify** (proven in Node V8 AND workerd). ADR-0002 complete.
 - Toolchain: **PHP 8.0.30**; Emscripten = **seanmorris fork 3.1.68 (`sm-updates`)**,
   not stock 4.0.19 (ADR-0007 supersedes ADR-0004).
 - PoC scope and success criteria: ADR-0005. Kill criterion: ADR-0006.
 
-Build artifacts (not committed; `*.wasm` and `worker/build/` gitignored) live in the
+Build artifacts (not committed; `*.wasm` and `worker/build/*.mjs*` gitignored) live in the
 scratch checkout: `~/scratch/php-wasm-upstream/packages/php-wasm/`.
-Source deltas for Sessions 2–3 are committed as patches.
+`worker/build/trampoline-vp.wasm` IS committed (31 bytes, not gitignored).
+Source deltas for Sessions 2–5 are committed as patches.
 
 ---
 
@@ -88,76 +88,63 @@ Source deltas for Sessions 2–3 are committed as patches.
 3. **[DONE] Prove suspend/resume in Node V8.** Promise resolves on a later
    macrotask; `after: 42` confirmed with correct ordering. Hard-kill criterion
    (ADR-0006) satisfied — PASS (2026-06-07).
-4. **[BLOCKED] Port the PoC into workerd (Asyncify).** The Asyncify binary cannot
-   initialize in workerd — `addFunction/convertJsFunctionToWasm` hits an embedder
-   restriction (ADR-0012). The `instantiateWasm` hook works; glue patches 1 and 2
-   work; patch 3 has no JS-level fix. Artifacts committed.
-5. **[NEXT] JSPI rebuild + workerd PoC.** Rebuild with JSPI (drop MAIN_MODULE or
-   libxml), confirm suspend/resume in workerd. JSPI availability confirmed (ADR-0013).
-   See BUILD.md Session 5 outline and DECISIONS.md ADR-0012/0013 for the plan.
+4. **[DONE] Port the PoC into workerd (Asyncify).** Three glue patches identified;
+   init blocker hit (`addFunction/convertJsFunctionToWasm → new WebAssembly.Module`
+   blocked by workerd). Artifacts committed. JSPI confirmed available in workerd.
+5. **[DONE] Fix init blocker + confirm Asyncify in workerd.** `WITH_LIBXML=static`
+   eliminates dynamic libxml2 GOT symbols. Pre-compiled `vp` trampoline (31 bytes,
+   bundled by wrangler) resolves the 6 Emscripten console GOT.func symbols.
+   `curl http://localhost:8791/` → `before:\nafter: 42\n` — PASS (2026-06-09).
 
-A passing Session 3 is the real milestone; everything after it is
-integration, which is lower risk.
+**The PoC is complete.** The ADR-0005 success criterion is satisfied in workerd.
+ADR-0006 is fully satisfied. The Asyncify suspend/resume primitive is proven in
+both Node V8 and Cloudflare Workers / workerd.
 
 ---
 
 ## Open risks / verification items
 
-1. **JSPI build: unknown undefined-symbol count without MAIN_MODULE.** When
-   rebuilding without dynamic linking (`MAIN_MODULE=0`) or with `--disable-libxml`,
-   the link step may surface additional undefined symbols. On the seanmorris pipeline,
-   `MAIN_MODULE=1` is the default; rebuilding without it is untested for this config.
-   Expect one or two link-time iterations to resolve any remaining symbol gaps.
-
-2. **Link-time license audit — RESOLVED (ADR-0011, 2026-06-07).** GNU libiconv was
+1. **Link-time license audit — RESOLVED (ADR-0011, 2026-06-07).** GNU libiconv was
    an optional WASM side module (not statically linked). Dropped via `WITH_ICONV=0`;
    no LGPL component remains in the binary or distribution. OpenSSL 1.1.1x is
    permissive. See `NOTICE` and `RESULTS.md`.
 
-3. **Exhaustive suspendable-frames list (JSPI).** Under JSPI, only explicitly
-   declared suspending imports can suspend — there is no whole-program instrumentation.
-   The JSPI binary must correctly wrap `fp_async_call` as a `WebAssembly.Suspending`
-   function. If there are intermediate C frames that prevent suspension (e.g. due to
-   non-suspendable callbacks), they must be resolved. Less likely to be a problem for
-   a leaf import, but untested.
+2. **libtidy license.** `WITH_TIDY=static` links libtidy (HTML Tidy) statically.
+   HTML Tidy uses a permissive zlib-like license — no copyleft. Confirm in `NOTICE`
+   before any public release of the binary.
 
-4. **JSPI production status.** JSPI is confirmed available in workerd (ADR-0013)
-   at compatibility date 2024-09-23. Its long-term stability/documentation status
-   in Cloudflare Workers production is not separately verified.
+3. **trampoline-vp.wasm signature coverage.** Only the `vp` (void, i32) signature is
+   pre-compiled. If any future PHP wasm build introduces new GOT.func JS-function
+   symbols with different signatures (e.g. `vi`, `iii`), additional trampoline wasm
+   files would be needed. For the current Session 5 binary, 6 symbols all use `vp`
+   and no others were observed (confirmed by debug logging).
+
+4. **JSPI as optimization path.** JSPI is confirmed available in workerd (ADR-0013).
+   It would reduce binary size (no whole-program Asyncify instrumentation) and
+   per-call overhead. If either matters for production use, Session 6 can pursue JSPI
+   independently — the ADR-0002 sequence is now complete.
 
 ---
 
 ## Next action
 
-**Session 4 BLOCKED.** The Asyncify path hits a hard incompatibility in workerd
-(ADR-0012). Session 4 artifacts committed. JSPI confirmed available (ADR-0013).
+**Session 5 PASS.** The Asyncify PoC is complete. `before:\nafter: 42\n` from
+workerd (2026-06-09).
 
-**Next: Session 5 — JSPI rebuild for workerd.** The plan:
+**Potential next sessions (optional — the PoC objective is met):**
 
-1. **Build change** — in the seanmorris pipeline checkout, modify the Session 3
-   patches to rebuild with JSPI instead of Asyncify:
-   - Replace `-sASYNCIFY=1` with `-sJSPI=1` in `EXTRA_FLAGS`.
-   - Replace `-s ASYNCIFY_IMPORTS=fp_async_call` with `-sJSPI_IMPORTS=fp_async_call`
-     (or the Emscripten 3.1.68 equivalent).
-   - Drop `MAIN_MODULE=1` or pass `--disable-libxml` to resolve undefined libxml2
-     symbols without needing `addFunction` stubs.
-   - In `library_fp_async.js`, remove the `Asyncify.handleAsync` wrapper; make the
-     function an `async` JS function returning a Promise directly (JSPI handles the
-     suspend/resume at the binary level via `fp_async_call__async: true` or the JSPI
-     import declaration).
+1. **JSPI port (optimization).** Rebuild with JSPI + `WITH_LIBXML=static` to get a
+   smaller binary (drops Asyncify instrumentation) and lower per-call overhead. The
+   trampoline fix applies equally to JSPI since MAIN_MODULE=1 remains. Compare binary
+   sizes and latency in RESULTS.md. Use `WebAssembly.Suspending`/`WebAssembly.promising`
+   in `worker/index.mjs` instead of `ccall({async: true})`.
 
-2. **New worker entry** — replace `ccall({async: true})` with JSPI primitives:
-   ```js
-   const suspendingFpAsync = new WebAssembly.Suspending(async (payload) => {
-       return payload + 1;  // or a real async host call
-   });
-   // Provide under env.fp_async_call in the imports map
-   const promisingRun = WebAssembly.promising(instance.exports.pib_run);
-   await promisingRun('?>' + PHP_CODE);
-   ```
+2. **Real async host call.** Replace the `setTimeout(0)` stub with an actual async
+   operation (KV read, D1 query, R2 fetch) to demonstrate the real-world pattern.
 
-3. **Verify** — `wrangler dev`, `curl localhost:8787/` → `before:\nafter: 42\n`.
+3. **PHP version bump.** Port to PHP 8.3 or 8.4 (end-of-life 8.0 replaced with a
+   supported branch). The build structure is the same; only the version string and
+   source tarball change.
 
-**Success criterion:** same as ADR-0005 but delivered via workerd HTTP response:
-`before:\n` then `after: 42\n`, with `[worker] before:` / `[worker] after:` console
-ordering confirming the suspend/resume cycle ran inside workerd.
+4. **Binary size reduction.** Strip unused extensions from `.env_8.0.ci` to shrink
+   the wasm below 10 MB raw, improving cold-start latency.

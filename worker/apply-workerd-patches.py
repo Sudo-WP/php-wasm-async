@@ -65,6 +65,28 @@ else:
     print('WARNING: Patch 2b target not found (may be OK if this polyfill is absent)')
     changes.append('Patch 2b: __setImmediate_cb useCapture — NOT FOUND (skipped)')
 
+# Patch 3: convertJsFunctionToWasm cache
+# workerd blocks synchronous new WebAssembly.Module(bytes) (JIT code-gen restriction).
+# Emscripten's addFunction calls convertJsFunctionToWasm to create wasm trampolines for
+# JS functions used as function pointers via GOT.func. All 6 affected symbols
+# (emscripten_console_log, _error, _warn, _trace, emscripten_out, emscripten_err)
+# have sig 'vp'. worker/index.mjs pre-compiles the trampoline for 'vp' asynchronously
+# using WebAssembly.compile (allowed) and stores it in globalThis.__phpWasmTrampolines.
+# This patch makes convertJsFunctionToWasm use that cache instead of re-compiling.
+OLD3 = 'var module=new WebAssembly.Module(new Uint8Array(bytes));'
+NEW3 = ('var module=globalThis.__phpWasmTrampolines&&globalThis.__phpWasmTrampolines.has(sig)'
+        '?globalThis.__phpWasmTrampolines.get(sig)'
+        ':new WebAssembly.Module(new Uint8Array(bytes));')
+if OLD3 in text:
+    text = text.replace(OLD3, NEW3, 1)
+    changes.append('Patch 3: convertJsFunctionToWasm trampoline cache — applied')
+elif NEW3 in text:
+    changes.append('Patch 3: convertJsFunctionToWasm trampoline cache — already applied')
+else:
+    print('ERROR: Patch 3 target string not found in glue file. '
+          'The glue format may have changed.')
+    sys.exit(1)
+
 GLUE.write_text(text, encoding='utf-8')
 
 print(f'Patched {GLUE} ({original_len} → {len(text)} bytes):')

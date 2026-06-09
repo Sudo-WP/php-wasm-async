@@ -10,8 +10,107 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0015 — Session 5 PASS: Asyncify works in workerd with static libxml + pre-compiled trampoline
+**Date:** 2026-06-09 · **Status:** Accepted · **Supersedes:** ADR-0012, ADR-0013 (prescription); **Corrects (in part):** ADR-0014
+
+**Result.** The ADR-0005 success criterion is satisfied in workerd:
+`curl http://localhost:8791/` returns `before:\nafter: 42\n`.
+The Asyncify suspend/resume cycle completes inside workerd:
+
+```
+[fp_async_call] invoked payload=41
+[fp_async_call] promise registered, returning control to host
+[fp_async_call] timer fired, resolving promise -> 42
+[fp_async_call] wasm resumed, returning 42
+```
+
+`before:` is printed before the timer fires; `after: 42` is printed after — the ordering proof is identical to Session 3 (Node V8). ADR-0002's "Asyncify first" path is complete. ADR-0006's hard-kill criterion is satisfied in workerd as well as Node V8.
+
+**Correction to ADR-0014's root-cause analysis.** ADR-0014 identified the blocker as
+"four libxml2 GOT symbols (`xmlStrdup`, `xmlStrncmp`, `xmlURIUnescapeString`, `xmlUnlinkNode`)
+leave `addFunction` firing during `xmlInitParser()`." That was accurate but incomplete.
+
+After `WITH_LIBXML=static` (which statically links `lib/lib/libxml2.a` and eliminates
+those four symbols), the worker still hit the SAME stack trace. Debug instrumentation
+identified 6 different symbols:
+
+| GOT.func symbol | JS function name | sig |
+|---|---|---|
+| `emscripten_console_log` | `_emscripten_console_log` | `vp` |
+| `emscripten_console_error` | `_emscripten_console_error` | `vp` |
+| `emscripten_console_warn` | `_emscripten_console_warn` | `vp` |
+| `emscripten_console_trace` | `_emscripten_console_trace` | `vp` |
+| `emscripten_out` | `_emscripten_out` | `vp` |
+| `emscripten_err` | `_emscripten_err` | `vp` |
+
+All six are Emscripten's console/output functions. They appear in the main wasm's
+`GOT.func` section because C code (in PHP, libxml2, libtidy, or Emscripten runtime)
+holds function pointers to them. `resolveGlobalSymbol` finds them as JS functions in
+`wasmImports` (not as wasm exports), so `addFunction` → `convertJsFunctionToWasm` fires.
+
+**General root cause (correcting ADR-0014's narrow reading).**
+Emscripten MAIN_MODULE=1 always runs `reportUndefinedSymbols` after instantiation —
+even with no dynamic libs. For every GOT.func entry whose value is still 0 and whose
+symbol resolves to a JS function in `wasmImports`, `addFunction` tries to:
+1. `setWasmTableEntry(slot, jsFunc)` → fails (TypeError: funcref tables reject plain JS functions).
+2. `convertJsFunctionToWasm(jsFunc, sig)` → tries `new WebAssembly.Module(bytes)` → BLOCKED.
+
+Switching libxml2 to static resolves the libxml2 GOT entries but not the 6 Emscripten
+console entries. The underlying incompatibility is: MAIN_MODULE=1 requires runtime wasm
+compilation for GOT.func JS-function trampolines; workerd blocks ALL runtime wasm
+compilation (synchronous AND asynchronous via `WebAssembly.compile`).
+
+**Fix: wrangler-bundled trampoline module.**
+Wrangler compiles `.wasm` imports at bundle time (pre-AOT) and makes them available as
+`WebAssembly.Module` objects. The only path that works in workerd is:
+`new WebAssembly.Instance(pre_bundled_module, {e: {f: jsFunc}})`.
+
+All 6 symbols use the same signature `vp` (void, i32). A single 31-byte trampoline wasm
+encapsulates the type signature and re-exports the import:
+
+```
+[wasm magic + version]  0,97,115,109,1,0,0,0
+[type section]          1,5,1,96,1,127,0       // (i32)->void
+[import "e"."f"]        2,7,1,1,101,1,102,0,0
+[export "f"]            7,5,1,1,102,0,0
+```
+
+`trampoline-vp.wasm` (31 bytes) is committed to `worker/build/trampoline-vp.wasm`.
+`worker/index.mjs` imports it (`import trampolineVP from './build/trampoline-vp.wasm'`)
+and sets `globalThis.__phpWasmTrampolines = new Map([['vp', trampolineVP]])` in the
+`instantiateWasm` hook before PHP module instantiation.
+`apply-workerd-patches.py` Patch 3 replaces `new WebAssembly.Module(bytes)` in
+`convertJsFunctionToWasm` with a cache lookup:
+```js
+var module = globalThis.__phpWasmTrampolines && globalThis.__phpWasmTrampolines.has(sig)
+    ? globalThis.__phpWasmTrampolines.get(sig)
+    : new WebAssembly.Module(new Uint8Array(bytes));  // fallback for non-workerd
+```
+
+**What this supersedes.**
+- ADR-0012: the Asyncify+MAIN_MODULE binary IS compatible with workerd when the
+  GOT.func trampolines are pre-compiled at bundle time. The "hard stop" is resolved.
+- ADR-0013: JSPI is not required for the PoC. ADR-0002's "Asyncify first" completes.
+  JSPI remains a valid optimization path (smaller binary, less overhead) for Session 6.
+- ADR-0014: the root cause is the full MAIN_MODULE GOT.func trampoline requirement, not
+  specifically the four libxml2 symbols. `WITH_LIBXML=static` is a prerequisite (it
+  eliminates the dynamic libxml2 side module and the libxml2 GOT entries) but is not
+  sufficient on its own — the 6 Emscripten console trampolines must also be resolved.
+
+**Binary sizes (Session 5).**
+
+| Artifact | Session 4 (WITH_LIBXML=dynamic) | Session 5 (WITH_LIBXML=static) |
+|---|---|---|
+| `php8.0-worker.mjs.wasm` raw | 12,183,180 B | 15,831,979 B |
+| `php8.0-worker.mjs` glue raw | 309,714 B | 309,714 B |
+| `trampoline-vp.wasm` | — | 31 B |
+
+The +3.6 MB wasm increase is libxml2.a (~7.5 MB raw, ~3.6 MB of effective code after linking) plus libtidy.a (required when `WITH_TIDY=static`, forced by the tidy/libxml dependency constraint).
+
+---
+
 ## ADR-0014 — Session 5 reframing: the blocker is dynamic linking, not Asyncify; change one variable
-**Date:** 2026-06-09 · **Status:** Accepted · **Supersedes (in part):** ADR-0012, ADR-0013
+**Date:** 2026-06-09 · **Status:** Accepted (the approach stands); **Partially corrected by ADR-0015** (root cause was more general than libxml2 alone) · **Supersedes (in part):** ADR-0012, ADR-0013
 
 **Reframing.** ADR-0012 concluded "Asyncify+MAIN_MODULE binary incompatible with workerd" and
 ADR-0013 concluded "switch to JSPI." This was premature: the Session 4 failure happened in the
@@ -66,7 +165,7 @@ for a genuine mechanism reason (not a linking issue), that is the trigger for JS
 ---
 
 ## ADR-0013 — JSPI confirmed available in workerd; designated path for workerd integration
-**Date:** 2026-06-08 · **Status:** Accepted (JSPI availability finding); prescription deferred pending Session 5 Asyncify result — see ADR-0014 · **Depends on:** ADR-0012
+**Date:** 2026-06-08 · **Status:** Accepted (JSPI availability finding stands); prescription ("JSPI required for workerd") superseded by ADR-0015 (Asyncify works in workerd) · **Depends on:** ADR-0012
 
 **Decision.** JSPI (JavaScript-Promise Integration) is the designated mechanism for
 the workerd integration. Session 4 probe confirmed that workerd (wrangler 4.96.0,
@@ -102,7 +201,7 @@ accelerates that plan to replace Asyncify entirely for the workerd target.
 ---
 
 ## ADR-0012 — workerd hard stop: Asyncify+MAIN_MODULE binary incompatible with workerd
-**Date:** 2026-06-08 · **Status:** Accepted · **Per:** ADR-0006 hard-stop criterion
+**Date:** 2026-06-08 · **Status:** Superseded by ADR-0015 (the binary IS compatible once GOT.func trampolines are pre-compiled at bundle time) · **Per:** ADR-0006 hard-stop criterion
 
 **Decision.** Session 4 encountered a hard blocker: the Asyncify binary built by the
 seanmorris pipeline with `MAIN_MODULE=1` (dynamic linking) cannot initialize in

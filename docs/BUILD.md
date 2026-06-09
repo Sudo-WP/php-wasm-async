@@ -333,34 +333,89 @@ Result: `Suspending, promising, SuspendError` present; `WebAssembly.Function` un
 - `wrangler.toml` — wrangler config
 - `patches/session4-workerd-analysis.patch` — full three-patch analysis
 
-### Session 5 — JSPI build for workerd (outline)
+### Session 5 — WITH_LIBXML=static rebuild + workerd trampoline fix (validated 2026-06-09)
 
-**Goal:** rebuild the PHP wasm with JSPI instead of Asyncify, and without
-dynamic linking (`MAIN_MODULE=0` or `--disable-libxml`), to eliminate both the
-Asyncify instrumentation and the `addFunction/convertJsFunctionToWasm` blocker.
+**Goal:** fix the Session 4 init blocker and confirm Asyncify suspend/resume inside
+workerd. See DECISIONS.md ADR-0014 (approach) and ADR-0015 (result).
 
-**Required build changes:**
-1. Drop or stub libxml2 undefined symbols — either:
-   - `--disable-libxml` in PHP configure (drops ext/dom, ext/simplexml, ext/xml,
-     ext/xmlreader, ext/xmlwriter, ext/soap — acceptable for PoC); or
-   - `MAIN_MODULE=0` rebuild with fully static libxml2 (no GOT, no dynamic stubs).
-2. Add `-sJSPI=1` to Emscripten link flags (replaces `-sASYNCIFY=1`).
-3. Add `JSPI_IMPORTS=fp_async_call` to mark `fp_async_call` as a suspending import.
+**Part 1: Rebuild the PHP wasm with static libxml2 + libtidy.**
 
-**Worker entry changes for JSPI:**
-```js
-// Wrap the import as a JSPI suspending function
-const suspendingFpAsync = new WebAssembly.Suspending(
-    async (payload) => { /* resolve promise */ return payload + 1; }
-);
-// Provide it in the imports object under env.fp_async_call
-// Wrap the export as a promising function
-const promisingRun = WebAssembly.promising(instance.exports.pib_run);
-// Then: await promisingRun('?>' + PHP_CODE);
+Apply the session5 patch on top of sessions 2, 3, and iconv-resolution:
+
+```bash
+cd ~/scratch/php-wasm-upstream
+# Apply all four patches in order (from a clean upstream checkout)
+git apply ~/php-wasm-async/patches/session2-fp_async_call.patch
+git apply ~/php-wasm-async/patches/session3-suspend.patch
+git apply ~/php-wasm-async/patches/iconv-resolution.patch
+git apply ~/php-wasm-async/patches/session5-static-libxml.patch
+
+# REQUIRED: clear the PHP configure cache (--with-libxml path changed; stale
+# cache causes "cannot compute suffix of executables" configure error)
+docker run --rm -v /home/sikam/scratch/php-wasm-upstream:/src \
+    seanmorris/php-emscripten-builder:latest \
+    rm -f /src/.cache/config-cache /src/third_party/php8.0-src/configured
+
+# Build the worker-env glue (~20 min; libxml2 + libtidy now statically linked)
+make PHP_VERSION=8.0 ENV_FILE=.circleci/.env_8.0.ci worker-mjs
 ```
 
-This approach avoids all Asyncify glue, avoids the `addFunction` chain,
-and uses workerd's native JSPI support confirmed in Session 4.
+The session5 patch makes three changes (see the patch file for detail):
+1. `.circleci/.env_8.0.ci`: `WITH_LIBXML=1` → `WITH_LIBXML=static`,
+   `WITH_TIDY=1` → `WITH_TIDY=static`
+   (tidy requires libxml in the same mode; a `$(error ...)` in tidy's `static.mak`
+   enforces this).
+2. `Makefile`: adds `PHP_CONFIGURE_DEPS+= lib/lib/libxml2.a` sentinel.
+   (With `WITH_LIBXML=static`, libxml's `static.mak` does NOT add to
+   `PHP_CONFIGURE_DEPS`. The empty variable causes `$(MAKE) ${PHP_CONFIGURE_DEPS}`
+   to become a bare `$(MAKE)` → default goal `all` → `_all` → infinite recursion.
+   The sentinel keeps the variable non-empty and points to an already-built artifact.)
+
+**Verify Node V8 regression before proceeding to workerd:**
+
+```bash
+node test-regression.mjs   # expect: hello/"8.0.30" PASS
+node test-session3.mjs     # expect: before:/after: 42 PASS (ordering confirmed)
+```
+
+**Part 2: Copy artifacts and apply workerd patches.**
+
+```bash
+# Copy built artifacts to worker/build/ (gitignored directory)
+mkdir -p ~/php-wasm-async/worker/build
+cp ~/scratch/php-wasm-upstream/packages/php-wasm/php8.0-worker.mjs \
+   ~/scratch/php-wasm-upstream/packages/php-wasm/php8.0-worker.mjs.wasm \
+   ~/php-wasm-async/worker/build/
+
+# Apply all four workerd glue patches (idempotent; safe to re-run)
+python3 ~/php-wasm-async/worker/apply-workerd-patches.py
+```
+
+`apply-workerd-patches.py` applies four patches to `worker/build/php8.0-worker.mjs`:
+1. `self.location.href` guard (workerd ESM has `self.location = undefined`)
+2a. `Browser_setImmediate useCapture` → `false`
+2b. `__setImmediate_cb useCapture` → `false`
+3. `convertJsFunctionToWasm` cache: replaces `new WebAssembly.Module(bytes)` with a
+   `globalThis.__phpWasmTrampolines.get(sig)` lookup. `worker/index.mjs` populates
+   this map with the wrangler-bundled `trampoline-vp.wasm` before PHP instantiation.
+
+**Part 3: Run and verify in workerd.**
+
+```bash
+cd ~/php-wasm-async
+wrangler dev --local --port 8791 &
+sleep 5
+curl http://localhost:8791/
+# Expected: before:\nafter: 42\n
+```
+
+**The trampoline wasm** (`worker/build/trampoline-vp.wasm`, 31 bytes, committed) is
+the key. It implements the `vp` (void, i32) signature required by all 6 Emscripten
+console/output GOT.func symbols. Wrangler bundles it at compile time as a
+`WebAssembly.Module` (AOT-compiled, no runtime compilation). `new WebAssembly.Instance`
+of a pre-compiled bundled module IS allowed in workerd (instantiation, not compilation).
+Runtime compilation (`new WebAssembly.Module(bytes)` and `WebAssembly.compile(bytes)`)
+are both blocked; only bundle-time AOT compilation works.
 
 ## Known fragile steps
 

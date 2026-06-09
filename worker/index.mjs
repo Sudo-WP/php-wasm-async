@@ -1,25 +1,32 @@
 /**
- * php-wasm-async Session 4: suspend/resume PoC for Cloudflare Workers / workerd.
+ * php-wasm-async Session 5: suspend/resume PoC for Cloudflare Workers / workerd.
  *
  * Imports the Emscripten worker-env glue and the pre-compiled wasm module.
  * Wrangler bundles the .mjs glue and compiles the .wasm at bundle time —
- * the instantiateWasm hook hands the pre-compiled module to Emscripten,
- * bypassing the default fetch-based loading path.
+ * the instantiateWasm hook pre-compiles wasm trampolines for Emscripten's
+ * GOT.func JS-function stubs (blocked synchronously in workerd), then hands
+ * the pre-compiled PHP module to Emscripten via the receive callback.
  *
- * Status: BLOCKED — see docs/RESULTS.md Session 4 and DECISIONS.md ADR-0012.
- * The instantiateWasm hook works (wasm instantiates), but php_embed_init
- * fails because workerd blocks runtime WebAssembly.Module() compilation,
- * which is required by Emscripten's dynamic-linking stub mechanism
- * (addFunction → convertJsFunctionToWasm → new WebAssembly.Module(bytes)).
- * The libxml2 undefined-symbol stubs are needed by ext/libxml MINIT →
- * xmlInitParser(), called before any PHP code runs.
- * See ADR-0012 for the analysis and ADR-0013 for the JSPI path forward.
+ * Status: PASS — see docs/RESULTS.md Session 5.
+ * Asyncify suspend/resume works in workerd: curl http://localhost:8791/ returns
+ * "before:\nafter: 42\n". The key insight: WITH_LIBXML=static + pre-compiling
+ * the 'vp'-signature trampoline async resolves the MAIN_MODULE init blocker.
+ * Six GOT.func symbols (emscripten_console_log/_error/_warn/_trace,
+ * emscripten_out, emscripten_err) all require a vp trampoline; the cache is
+ * populated once before instantiation and reused for all six.
  *
  * Apache-2.0. Our own code; no GPL or LGPL content.
  */
 
 import PHP from './build/php8.0-worker.mjs';
 import phpWasm from './build/php8.0-worker.mjs.wasm';
+// Pre-compiled wasm trampoline for sig 'vp' (void, i32).
+// Wrangler compiles this .wasm at bundle time → WebAssembly.Module.
+// apply-workerd-patches.py Patch 3 makes convertJsFunctionToWasm read from
+// globalThis.__phpWasmTrampolines instead of calling new WebAssembly.Module(bytes),
+// which workerd forbids at runtime. Synchronous new WebAssembly.Instance of a
+// wrangler-bundled module (no new code generation) IS allowed.
+import trampolineVP from './build/trampoline-vp.wasm';
 
 // The PoC PHP script — identical to Node V8 Session 3 proof.
 const PHP_CODE = `<?php
@@ -49,6 +56,11 @@ async function runPhp() {
     // fetch path with the pre-compiled module bundled by wrangler.
     const mod = await PHP({
         instantiateWasm(imports, receive) {
+            // Expose the wrangler-bundled trampoline module for Patch 3 in
+            // apply-workerd-patches.py. No runtime compilation needed — wrangler
+            // pre-compiles trampolineVP at bundle time. Synchronous
+            // new WebAssembly.Instance of a bundled module is allowed in workerd.
+            globalThis.__phpWasmTrampolines = new Map([['vp', trampolineVP]]);
             WebAssembly.instantiate(phpWasm, imports).then(
                 instance => receive(instance, phpWasm)
             ).catch(e => console.error('[worker] instantiate error:', e));

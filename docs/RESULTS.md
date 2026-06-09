@@ -3,9 +3,9 @@
 Benchmarks and findings — what works, what does not, with evidence.
 Negative results are first-class and are recorded here, not glossed over.
 
-> **Status: iconv-resolution task complete (2026-06-07).** Session 3 PoC PASS
-> stands. GNU libiconv dropped (`WITH_ICONV=0`); no LGPL in binary or distribution.
-> Main wasm is byte-identical (12,183,180 B). Session 4 (port to workerd) is next.
+> **Status: Session 5 PASS (2026-06-09).** Asyncify suspend/resume confirmed in
+> workerd. `curl http://localhost:8791/` → `before:\nafter: 42\n`. The ADR-0005
+> success criterion is satisfied end-to-end. See Session 5 result section below.
 
 ---
 
@@ -309,6 +309,125 @@ Session 4 artifacts:
   evidence (committed)
 
 See ADR-0012 (blocker) and ADR-0013 (JSPI path) in `DECISIONS.md`.
+
+## Session 5 — workerd integration: PASS (2026-06-09)
+
+**PASS.** Asyncify suspend/resume confirmed inside workerd. The ADR-0005 success
+criterion is satisfied in the target serverless runtime. ADR-0006 is fully satisfied
+(both Node V8 and workerd pass).
+
+### Success criterion result
+
+```
+$ curl http://localhost:8791/
+before:
+after: 42
+```
+
+Two consecutive requests both returned `before:\nafter: 42\n`.
+
+### Host-side ordering (wrangler console)
+
+```
+[fp_async_call] invoked payload=41
+[fp_async_call] promise registered, returning control to host
+[fp_async_call] timer fired, resolving promise -> 42
+[fp_async_call] wasm resumed, returning 42
+```
+
+The ordering is identical to Session 3 (Node V8). `timer fired` appears after
+`returning control to host` — PHP suspended into the event loop and resumed after
+the macrotask resolved the Promise. The ordering proof is unambiguous.
+
+### What changed from Session 4 (the blocker and the fix)
+
+**Root cause (corrected — see ADR-0015).** Session 4 identified the blocker as four
+libxml2 GOT symbols (`xmlStrdup` etc.) causing `addFunction → convertJsFunctionToWasm
+→ new WebAssembly.Module(bytes)`. Session 5 showed this was incomplete: even after
+`WITH_LIBXML=static`, 6 Emscripten console/output symbols (`emscripten_console_log`,
+`_error`, `_warn`, `_trace`, `emscripten_out`, `emscripten_err`) still triggered the
+same path. All have sig `vp` (void, i32). The general cause: Emscripten MAIN_MODULE=1
+always runs `reportUndefinedSymbols` and calls `addFunction` for any GOT.func symbol
+that resolves to a JS function. Both synchronous (`new WebAssembly.Module`) and
+asynchronous (`WebAssembly.compile`) runtime wasm compilation are blocked in workerd.
+
+**Fix (two parts):**
+
+1. **`WITH_LIBXML=static` + `WITH_TIDY=static`** — switches libxml2 and libtidy from
+   WASM side modules to static archives in `ARCHIVES`. The four libxml2 symbols are
+   resolved at link time. `DYNAMIC_LIBS_GROUPED` no longer includes `xml-libs`, so
+   `loadDylibs` doesn't try to load a libxml2 side module. Required `WITH_TIDY=static`
+   because `php-wasm-tidy/static.mak` enforces `WITH_TIDY=dynamic → requires
+   WITH_LIBXML=dynamic`. Also required fixing `PHP_CONFIGURE_DEPS` (empty without
+   libxml's dynamic-mode contribution — would cause bare `$(MAKE)` infinite recursion;
+   fixed by adding `lib/lib/libxml2.a` as a sentinel in the Makefile). Required clearing
+   a stale configure cache (options changed from `--with-libxml=/src/lib/` to
+   `--with-libxml`; stale cache caused `cannot compute suffix of executables`).
+
+2. **Pre-compiled `vp` trampoline** — created `worker/build/trampoline-vp.wasm` (31 bytes):
+   a wasm module that imports `e.f` as `(i32)->void` and re-exports it as `f`. This is
+   the type signature needed by all 6 Emscripten console symbols. Wrangler bundles it at
+   compile time as a `WebAssembly.Module`. `worker/index.mjs` sets
+   `globalThis.__phpWasmTrampolines = new Map([['vp', trampolineVP]])` in the
+   `instantiateWasm` hook. `apply-workerd-patches.py` Patch 3 patches
+   `convertJsFunctionToWasm` to read from the cache: `new WebAssembly.Instance` of
+   a pre-compiled (not runtime-compiled) module IS allowed synchronously in workerd.
+
+### Node V8 regression (re-confirmed, Session 5 binary)
+
+```
+$ node test-regression.mjs
+hello: "hello\n"
+version: "8.0.30"
+RESULT: PASS
+
+$ node test-session3.mjs
+stdout (run 1): "before:\nafter: 42\n"
+stdout (run 2): "before:\nafter: 42\n"
+RESULT: PASS
+```
+
+Session 3 latency was preserved (same ordering, same timing class).
+
+### Build issues encountered and resolved (negative results)
+
+1. **WITH_TIDY constraint** — `WITH_LIBXML=static` with `WITH_TIDY=1` (dynamic) triggers
+   `$(error TIDY REQUIRES WITH_LIBXML=[dynamic])` in `php-wasm-tidy/static.mak`. Fixed by
+   `WITH_TIDY=static`.
+
+2. **PHP_CONFIGURE_DEPS empty → infinite recursion** — With `WITH_LIBXML=static`, no package
+   adds to `PHP_CONFIGURE_DEPS` (libxml's static.mak only adds in dynamic/shared mode).
+   Empty `${PHP_CONFIGURE_DEPS}` → bare `$(MAKE)` → `all` → `_all` → infinite recursion.
+   Fixed by adding `PHP_CONFIGURE_DEPS+= lib/lib/libxml2.a` sentinel in the Makefile.
+
+3. **Stale configure cache** — `--with-libxml=/src/lib/` (old cache) vs `--with-libxml`
+   (static mode) caused `cannot compute suffix of executables`. Fixed by deleting
+   `.cache/config-cache` and `third_party/php8.0-src/configured` via Docker.
+
+4. **WebAssembly.compile blocked in workerd** — first attempt at a pre-compile fix used
+   `await WebAssembly.compile(bytes)` in `instantiateWasm`. workerd (even in miniflare
+   local dev mode) blocks ALL runtime wasm compilation, including async
+   `WebAssembly.compile`. Fixed by bundling `trampoline-vp.wasm` as a static import
+   that wrangler AOT-compiles at bundle time.
+
+### Binary sizes (Session 5)
+
+| Artifact | Session 4 (dynamic libxml) | Session 5 (static libxml+tidy) |
+|---|---|---|
+| `php8.0-worker.mjs.wasm` raw | 12,183,180 B (11.62 MiB) | 15,831,979 B (15.10 MiB) |
+| `php8.0-worker.mjs` glue raw | 309,714 B | 309,714 B |
+| `trampoline-vp.wasm` raw | — | 31 B |
+
+The +3.65 MiB wasm increase is libxml2 + libtidy statically linked. Compresses well
+(libxml2 is highly repetitive data). Gzip estimated ~4.8 MiB (not yet measured).
+
+### Session 5 committed files
+
+- `worker/index.mjs` — updated: trampoline import + cache setup in `instantiateWasm`
+- `worker/build/trampoline-vp.wasm` — 31-byte bundled trampoline for sig `vp`
+- `worker/apply-workerd-patches.py` — Patch 3 added (cache-backed `convertJsFunctionToWasm`)
+- `patches/session5-static-libxml.patch` — env + Makefile changes for static build
+- `docs/DECISIONS.md` — ADR-0014 (pre-session) + ADR-0015 (result)
 
 ---
 
