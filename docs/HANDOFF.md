@@ -109,9 +109,10 @@ both Node V8 and Cloudflare Workers / workerd.
    no LGPL component remains in the binary or distribution. OpenSSL 1.1.1x is
    permissive. See `NOTICE` and `RESULTS.md`.
 
-2. **libtidy license.** `WITH_TIDY=static` links libtidy (HTML Tidy) statically.
-   HTML Tidy uses a permissive zlib-like license — no copyleft. Confirm in `NOTICE`
-   before any public release of the binary.
+2. **libtidy license — RESOLVED (2026-06-09).** `WITH_TIDY=static` links libtidy
+   (HTML Tidy) statically. HTML Tidy uses a permissive zlib-like license — no copyleft.
+   tidy-html5 (libtidy) attribution confirmed (2026-06-09): W3C Software License
+   (SPDX: HTMLTIDY), permissive, no copyleft. NOTICE updated. Pre-emptive risk closed.
 
 3. **trampoline-vp.wasm signature coverage.** Only the `vp` (void, i32) signature is
    pre-compiled. If any future PHP wasm build introduces new GOT.func JS-function
