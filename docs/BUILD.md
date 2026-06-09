@@ -492,6 +492,67 @@ The KV seeding must be done once after any `wrangler` state reset. The seeded va
 persists across `wrangler dev` restarts. Do not hardcode the value in the worker —
 keep the KV read on the real async path.
 
+### Session 7 — D1 SQL consumer (validated 2026-06-09)
+
+**Goal:** wire Cloudflare D1 as a second consumer of `fp_async_call`. No rebuild required —
+only `wrangler.toml` and `worker/index.mjs` change. See DECISIONS.md ADR-0017.
+
+**Part 1: Add D1 binding to `wrangler.toml`.**
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "php-wasm-async-dev"
+database_id = "local-dev-only"
+```
+
+`database_id` is a placeholder; `wrangler dev --local` creates the SQLite file
+automatically in `.wrangler/state/v3/d1/`.
+
+**Part 2: Create schema and seed data (once per local state reset).**
+
+```bash
+cd ~/php-wasm-async
+wrangler d1 execute DB --local --command \
+  "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);"
+wrangler d1 execute DB --local --command \
+  "INSERT OR REPLACE INTO config (key, value) VALUES ('greeting','hello from D1'),('farewell','goodbye from D1');"
+# Verify:
+wrangler d1 execute DB --local --command "SELECT * FROM config;"
+```
+
+The `wrangler d1 execute` command takes the **binding name** (`DB`) as the database argument,
+not the `database_name`. State persists across `wrangler dev` restarts.
+
+**Part 3: Run Node V8 regression (no rebuild needed).**
+
+```bash
+cd ~/scratch/php-wasm-upstream
+node test-regression.mjs    # hello/"8.0.30" — PASS (stub fallback)
+node test-session3.mjs      # before:/after: 42 — PASS (stub fallback)
+```
+
+**Part 4: Verify in workerd.**
+
+```bash
+cd ~/php-wasm-async
+wrangler dev --local --port 8791 &
+sleep 8
+curl http://localhost:8791/
+# Expected: before:\nafter: {"value":"hello from D1"} / {"value":"goodbye from D1"}\n
+# (Two sequential D1 queries — both suspend/resume in sequence)
+```
+
+Ordering markers in wrangler console confirm two suspend/resume cycles per request:
+```
+[fp_async_call] invoked payload={"action":"query",...,"params":["greeting"]}
+[fp_async_call] delegating to Module.hostAsyncCall    ← suspend #1
+[fp_async_call] wasm resumed, returning {"value":"hello from D1"}    ← resume #1
+[fp_async_call] invoked payload={"action":"query",...,"params":["farewell"]}
+[fp_async_call] delegating to Module.hostAsyncCall    ← suspend #2
+[fp_async_call] wasm resumed, returning {"value":"goodbye from D1"}  ← resume #2
+```
+
 ## Known fragile steps
 
 - **Exhaustive suspendable-imports list.** *Not a problem on this pipeline*

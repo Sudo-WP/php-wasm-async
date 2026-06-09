@@ -3,9 +3,10 @@
 Benchmarks and findings — what works, what does not, with evidence.
 Negative results are first-class and are recorded here, not glossed over.
 
-> **Status: Session 6 PASS (2026-06-09).** Real async host call demonstrated in workerd:
-> PHP suspends on `env.KV.get("greeting")` and resumes with the stored value.
-> `curl http://localhost:8791/` → `before:\nafter: hello from KV\n`. See Session 6 result below.
+> **Status: Session 7 PASS (2026-06-09).** D1 SQL consumer demonstrated in workerd:
+> PHP executes two sequential D1 queries mid-request, suspending on each real async call.
+> `curl http://localhost:8791/` → `before:\nafter: {"value":"hello from D1"} / {"value":"goodbye from D1"}\n`.
+> Sequential suspension stateless — both suspend/resume cycles complete correctly. See Session 7 result below.
 
 ---
 
@@ -549,6 +550,100 @@ The +615 B wasm delta is the new `fp_async_call` string-marshalling code.
 - `wrangler.toml` — KV namespace binding added
 - `patches/session6-real-async.patch` — full diff (pib.c + library_fp_async.js)
 - `docs/DECISIONS.md` — ADR-0016
+
+---
+
+## Session 7 — D1 SQL consumer: PASS (2026-06-09)
+
+**PASS.** PHP executes two sequential D1 SQL queries mid-request, suspending on each real
+`env.DB.prepare(...).bind(...).first()` Promise and resuming with the query result.
+No rebuild was required — only the Worker and wrangler config changed.
+
+### Success criterion result
+
+```
+$ curl http://localhost:8791/
+before:
+after: {"value":"hello from D1"} / {"value":"goodbye from D1"}
+```
+
+Two consecutive requests both returned the same result. The stretch goal (two sequential
+`fp_async_call` invocations) was achieved on the first attempt.
+
+### Host-side ordering (wrangler console — one full request)
+
+```
+[worker] before: calling pib_run
+[fp_async_call] invoked payload={"action":"query","sql":"SELECT value FROM config WHERE key=?","params":["greeting"]}
+[fp_async_call] delegating to Module.hostAsyncCall
+[fp_async_call] wasm resumed, returning {"value":"hello from D1"}
+[fp_async_call] invoked payload={"action":"query","sql":"SELECT value FROM config WHERE key=?","params":["farewell"]}
+[fp_async_call] delegating to Module.hostAsyncCall
+[fp_async_call] wasm resumed, returning {"value":"goodbye from D1"}
+[worker] after: pib_run complete
+```
+
+Two complete suspend/resume cycles in sequence. `delegating` marks Asyncify unwinding the
+PHP stack into the event loop; `wasm resumed` marks Asyncify rewinding it after the D1
+Promise resolved. Both cycles complete correctly — the wasm stack state is fully preserved
+and restored independently for each call.
+
+### Why this matters (sequential suspension proof)
+
+WordPress makes many database calls per request. The ordering above proves that Asyncify
+stack unwind/rewind is **stateless across calls**: the second `fp_async_call` suspends and
+resumes correctly even though the first already ran a full unwind/rewind cycle. The wasm
+Asyncify buffer is not "consumed" by the first call. This is the critical invariant that
+makes the primitive usable for real PHP applications.
+
+### What changed from Session 6
+
+No rebuild. No changes to `pib.c`, `library_fp_async.js`, or the wasm binary.
+
+1. **`wrangler.toml`** — added `[[d1_databases]] binding="DB"`.
+
+2. **`worker/index.mjs`** — D1 handler replaces the KV handler (KV kept as comment):
+   ```js
+   mod.hostAsyncCall = async (payload) => {
+       const req = JSON.parse(payload);
+       if (req.action === 'query') {
+           const row = await env.DB.prepare(req.sql).bind(...(req.params ?? [])).first();
+           return JSON.stringify(row ?? null);
+       }
+       return JSON.stringify({ error: 'unknown action: ' + req.action });
+   };
+   ```
+
+3. **`PHP_CODE`** — updated to make two sequential JSON-payload calls:
+   ```php
+   $r1 = fp_async_call('{"action":"query","sql":"SELECT value FROM config WHERE key=?","params":["greeting"]}');
+   $r2 = fp_async_call('{"action":"query","sql":"SELECT value FROM config WHERE key=?","params":["farewell"]}');
+   echo "after: " . $r1 . " / " . $r2 . "\n";
+   ```
+
+### Node V8 regression (Session 7 — no binary change)
+
+Both regression tests pass with the existing Session 6 binary (stub fallback path):
+
+```
+$ node test-regression.mjs
+hello: "hello\n"
+version: "8.0.30"
+RESULT: PASS
+
+$ node test-session3.mjs
+stdout (run 1): "before:\nafter: 42\n"
+stdout (run 2): "before:\nafter: 42\n"
+RESULT: PASS
+```
+
+### Session 7 committed files
+
+- `worker/index.mjs` — D1 handler, two-call PHP script
+- `wrangler.toml` — D1 database binding
+- `docs/DECISIONS.md` — ADR-0017
+
+No patch file (no C or JS library changes).
 
 ---
 

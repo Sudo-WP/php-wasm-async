@@ -10,6 +10,84 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0017 — Session 7: D1 (SQL) as second consumer; JSON as the consumer-owned payload encoding
+**Date:** 2026-06-09 · **Status:** Accepted
+
+**Decision.** Wire Cloudflare D1 (serverless SQLite) as the second consumer of `fp_async_call`,
+demonstrating PHP executing a SQL query mid-request by suspending on a real D1 async call and
+resuming with the query result. **No rebuild is required** — the `fp_async_call` ABI
+(`string → string`) established in ADR-0016 is already sufficient.
+
+**The generic-primitive invariant (from ADR-0016, restated for emphasis).**
+`library_fp_async.js` and `pib.c` must not change in this session and must not reference D1.
+The primitive passes a string payload from PHP and returns a string result to PHP. All
+encoding, dispatch, and store-access logic belongs to the Worker's `mod.hostAsyncCall` handler.
+
+**Payload encoding decision — JSON, owned by the consumer.**
+KV (Session 6) used a flat string as the payload (the key name). D1 needs to pass structured
+data: an action discriminant, a SQL string, and query parameters. The encoding choice — JSON
+— is made by this consumer and is not baked into `fp_async_call`. Document this as a convention:
+consumers may use any serialization they choose; `fp_async_call` is transport-agnostic.
+
+For this consumer, the convention is:
+- **PHP sends:** `JSON.stringify({action, sql, params})`, e.g.
+  `'{"action":"query","sql":"SELECT value FROM config WHERE key=?","params":["greeting"]}'`
+- **Handler returns:** `JSON.stringify(firstRow)`, e.g. `'{"value":"hello from D1"}'`
+- PHP receives the JSON string and can decode it with `json_decode()`.
+
+This is not a framework — it is the minimal convention for one consumer. Future consumers
+may use different encodings; the primitive does not impose one.
+
+**What changes in Session 7.**
+
+1. **`wrangler.toml`** — adds a `[[d1_databases]]` binding (`binding = "DB"`). The `database_id`
+   is a placeholder for local development; `wrangler dev --local` creates the SQLite file
+   automatically in `.wrangler/state/d1/`.
+
+2. **`worker/index.mjs`** — the `mod.hostAsyncCall` handler is replaced with a D1 dispatcher:
+   ```js
+   mod.hostAsyncCall = async (payload) => {
+       const req = JSON.parse(payload);
+       if (req.action === 'query') {
+           const row = await env.DB.prepare(req.sql).bind(...(req.params ?? [])).first();
+           return JSON.stringify(row ?? null);
+       }
+       return JSON.stringify({error: 'unknown action'});
+   };
+   ```
+   The KV handler from Session 6 is kept as a comment for reference.
+
+3. **`PHP_CODE`** — updated to use the JSON convention:
+   ```php
+   $result = fp_async_call('{"action":"query","sql":"SELECT value FROM config WHERE key=?","params":["greeting"]}');
+   echo "after: " . $result . "\n";
+   ```
+
+4. **Local D1 setup** — schema and seed applied once via `wrangler d1 execute`:
+   ```bash
+   wrangler d1 execute DB --local --command \
+     "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);"
+   wrangler d1 execute DB --local --command \
+     "INSERT OR REPLACE INTO config VALUES ('greeting','hello from D1'),('farewell','goodbye from D1');"
+   ```
+
+**Stretch goal: sequential suspension.** Two `fp_async_call` invocations in sequence —
+each suspends and resumes independently. This directly validates that the Asyncify stack
+unwind/rewind is stateless across calls (critical for WordPress, which makes many DB calls
+per request). Seeding a second key (`farewell`) and running the two-call PHP script proves this.
+
+**No rebuild required.** The wasm binary is unchanged. The trampoline fix, all glue patches,
+and the Session 6 artifacts are reused without modification.
+
+**Alternatives considered.**
+- Binary payload (e.g. msgpack): more efficient but harder to read and not justified for a PoC.
+- Separate host functions per store (`fp_d1_query`, `fp_kv_get`): requires a new C function,
+  new arginfo, and a recompile per store. Rejected — the whole point of the generic primitive
+  is that the Worker handles dispatch; the wasm binary stays unchanged across stores.
+- Protocol buffer or CBOR encoding: over-engineered for a PoC; JSON is readable and builtin.
+
+---
+
 ## ADR-0016 — Session 6: generalize fp_async_call to a registered string handler; KV as first real consumer
 **Date:** 2026-06-09 · **Status:** Accepted
 

@@ -25,15 +25,23 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Session 6 PASS (2026-06-09). Real async host call demonstrated: PHP suspends
-on `env.KV.get("greeting")` and resumes with the stored value in workerd. The generic
-`fp_async_call` primitive dispatches to a registered `Module.hostAsyncCall` handler set
-per-request by the Worker; KV is the first real consumer of the store-agnostic primitive.
+**Phase:** Session 7 PASS (2026-06-09). D1 (Cloudflare serverless SQL) wired as second consumer
+of `fp_async_call`. PHP executes two sequential SQL queries mid-request via D1, suspending on
+each real async call and resuming with the query result. No rebuild required — only `wrangler.toml`
+and `worker/index.mjs` changed.
 
-**Session 6 result.** `curl http://localhost:8791/` returns `before:\nafter: hello from KV\n`.
-The ordering markers confirm: `[fp_async_call] delegating to Module.hostAsyncCall` (suspend)
-→ KV Promise resolves → `[fp_async_call] wasm resumed` (resume). Two consecutive requests both
-succeeded. Node V8: all three tests pass (regression, session3 stub fallback, session6 handler).
+**Session 7 result.** `curl http://localhost:8791/` returns
+`before:\nafter: {"value":"hello from D1"} / {"value":"goodbye from D1"}\n`.
+Ordering markers confirm two complete suspend/resume cycles in sequence — the Asyncify stack
+unwind/rewind is stateless across calls. Node V8 regression: PASS (stub fallback, no rebuild).
+
+**Session 7 changes (on top of Session 6, no rebuild):**
+- `wrangler.toml`: `[[d1_databases]] binding="DB"` added.
+- `worker/index.mjs`: D1 handler registered per request; parses JSON payload, runs
+  `env.DB.prepare(sql).bind(...params).first()`, returns `JSON.stringify(row)`.
+  KV handler from Session 6 kept as comment.
+- `PHP_CODE`: two sequential `fp_async_call` invocations with JSON payloads.
+- Local D1 seed: `wrangler d1 execute DB --local --command "INSERT OR REPLACE INTO config..."`.
 
 **Session 6 changes (on top of Session 5):**
 - `fp_async_call` is now `string → string` (was `int → int`). Payload: UTF-8 key string.
@@ -42,7 +50,6 @@ succeeded. Node V8: all three tests pass (regression, session3 stub fallback, se
   and returns the handler's resolved string. Fallback: old stub (parseInt(payload)+1 as string)
   keeps all prior Node V8 tests passing.
 - `wrangler.toml` KV binding (`KV`); `worker/index.mjs` registers the KV handler per request.
-- Seed: `wrangler kv key put --binding=KV "greeting" "hello from KV" --local --preview false`.
 
 **Session 5 approach (ADR-0014 + ADR-0015, unchanged in Session 6).**
 - `WITH_LIBXML=static` + `WITH_TIDY=static` in `.circleci/.env_8.0.ci` — switches
@@ -68,7 +75,13 @@ succeeded. Node V8: all three tests pass (regression, session3 stub fallback, se
 - `patches/session6-real-async.patch` — pib.c string ABI + library_fp_async.js handler
 - `docs/DECISIONS.md` — ADR-0016
 
+**Session 7 committed files (on top of Session 6, no rebuild):**
+- `worker/index.mjs` — D1 handler, two-call PHP script, KV handler as comment
+- `wrangler.toml` — D1 database binding added
+- `docs/DECISIONS.md` — ADR-0017
+
 **What all sessions established (all true):**
+- Session 7 PASS: D1 SQL consumer — two sequential queries from PHP mid-request, both PASS.
 - Session 6 PASS: real async host call — PHP suspends on `env.KV.get()`, resumes with stored value.
 - Session 5 PASS: Asyncify suspend/resume in workerd — `before:\nafter: 42\n`.
 - Session 3 PASS: Asyncify suspend/resume in Node V8 — `before:\nafter: 42\n`.
@@ -119,9 +132,14 @@ Source deltas for Sessions 2–5 are committed as patches.
    primitive stays store-agnostic. `curl http://localhost:8791/` → `before:\nafter: hello from KV\n`
    — PASS (2026-06-09). Node V8: regression + stub fallback + handler — all PASS.
 
+7. **[DONE] D1 SQL consumer.** D1 wired as second consumer via JSON payload convention.
+   Two sequential queries per request — both suspend/resume independently, proving Asyncify
+   stack is stateless across calls. No rebuild. `curl http://localhost:8791/` →
+   `before:\nafter: {"value":"hello from D1"} / {"value":"goodbye from D1"}\n` — PASS (2026-06-09).
+
 **The PoC is complete.** The ADR-0005 success criterion is satisfied in workerd.
 ADR-0006 is fully satisfied. The Asyncify suspend/resume primitive is proven in
-both Node V8 and Cloudflare Workers / workerd, against a real async host operation.
+both Node V8 and Cloudflare Workers / workerd, against real async host operations (KV and D1).
 
 ---
 
@@ -152,25 +170,25 @@ both Node V8 and Cloudflare Workers / workerd, against a real async host operati
 
 ## Next action
 
-**Session 6 PASS.** Real async host call demonstrated: PHP suspends on a genuine
-`env.KV.get()` and resumes with the stored value, in workerd (2026-06-09).
-The generic `fp_async_call` primitive remains store-agnostic.
+**Session 7 PASS.** D1 SQL consumer wired. Two sequential queries from PHP mid-request,
+both suspend/resume correctly. `fp_async_call` remains store-agnostic (2026-06-09).
 
 **Potential next sessions (optional — the PoC + productization demo is complete):**
 
-1. **JSPI port (optimization).** Rebuild with JSPI + `WITH_LIBXML=static` to get a
+1. **PHP version bump.** Port to PHP 8.2 or 8.3 (8.0 is end-of-life). The build structure
+   is the same; only the version string, source tarball, and potentially the PHP configure
+   flags need updating. This is likely the highest-priority next step for real-world adoption.
+
+2. **JSPI port (optimization).** Rebuild with JSPI + `WITH_LIBXML=static` to get a
    smaller binary (drops Asyncify instrumentation) and lower per-call overhead. The
    trampoline fix applies equally to JSPI since MAIN_MODULE=1 remains. Compare binary
    sizes and latency in RESULTS.md. Use `WebAssembly.Suspending`/`WebAssembly.promising`
    in `worker/index.mjs` instead of `ccall({async: true})`.
 
-2. **Additional store consumers.** Wire D1 (SQL), R2 (object storage), or Durable Objects
-   as additional consumers of `fp_async_call`. The primitive is already generic; each
-   consumer is a one-line `mod.hostAsyncCall` registration in the Worker. No rebuild needed.
-
-3. **PHP version bump.** Port to PHP 8.3 or 8.4 (end-of-life 8.0 replaced with a
-   supported branch). The build structure is the same; only the version string and
-   source tarball change.
+3. **R2 / Durable Objects consumers.** Wire R2 (object storage) or Durable Objects as
+   additional consumers of `fp_async_call`. Each is a `mod.hostAsyncCall` dispatch case
+   in `worker/index.mjs`. No rebuild needed; JSON payload convention already supports
+   arbitrary action dispatch.
 
 4. **Binary size reduction.** Strip unused extensions from `.env_8.0.ci` to shrink
    the wasm below 10 MB raw, improving cold-start latency.

@@ -2,12 +2,18 @@ name = "php-wasm-async-poc"
 main = "worker/index.mjs"
 compatibility_date = "2024-09-23"
 
-# Local KV namespace for Session 6: real async host call demo.
-# The binding name "KV" is accessed as env.KV inside the Worker.
-# id/preview_id are required by wrangler schema validation; they are not
-# used in local dev mode (wrangler dev --local uses miniflare's in-memory KV).
-# Seed the key before testing: see docs/BUILD.md Session 6.
+# KV namespace — Session 6 demo (kept for reference; not the active handler).
+# Seed: wrangler kv key put --binding=KV "greeting" "hello from KV" --local --preview false
 [[kv_namespaces]]
 binding = "KV"
 id = "local-dev-only"
 preview_id = "local-dev-only"
+
+# D1 database — Session 7 demo (active handler).
+# database_id is a placeholder; wrangler dev --local creates the SQLite file
+# automatically in .wrangler/state/d1/. No Cloudflare credentials needed.
+# Seed: see docs/BUILD.md Session 7.
+[[d1_databases]]
+binding = "DB"
+database_name = "php-wasm-async-dev"
+database_id = "local-dev-only"
