@@ -1,47 +1,53 @@
 /**
- * php-wasm-async Session 7: D1 SQL query from PHP mid-request.
+ * php-wasm-async Session 8: multi-version Worker — PHP 8.2 + 8.4 from one deployment.
  *
- * PHP calls fp_async_call with a JSON payload encoding a SQL action; the Worker
- * handler parses it, runs env.DB.prepare(...).bind(...).first(), and returns the
- * row as a JSON string. PHP resumes with the JSON result and can decode it with
- * json_decode(). The primitive (fp_async_call / pib.c / library_fp_async.js)
- * is unchanged from Session 6 — only the Worker-side handler changes.
+ * Both PHP versions are imported statically: wrangler bundles and AOT-compiles
+ * every .wasm import at deploy time (the same property the trampoline fix relies
+ * on — workerd blocks all runtime wasm compilation, see ADR-0015), and the glue
+ * .mjs modules are plain ESM imports resolved at bundle time. Version selection
+ * happens per request by choosing which already-imported module factory + wasm
+ * module to instantiate — never by dynamic import. See ADR-0018.
  *
- * JSON payload convention (consumer-owned, not baked into fp_async_call):
- *   PHP sends:    '{"action":"query","sql":"SELECT...","params":[...]}'
- *   Handler returns: '{"value":"hello from D1"}' (the first matching row as JSON)
- *   See docs/DECISIONS.md ADR-0017.
+ * Selection: X-PHP-Version request header ('8.2' or '8.4'); default 8.4.
  *
- * Stretch goal: two sequential fp_async_call invocations prove that Asyncify
- * stack unwind/rewind is stateless across calls (critical for WordPress DB usage).
+ * The PHP payload demo is unchanged from Session 7: two sequential D1 queries
+ * via fp_async_call (JSON payload convention, ADR-0017). The async primitive
+ * (fp_async_call / pib.c / library_fp_async.js) is version-agnostic.
  *
- * Trampoline fix (Session 5): six Emscripten GOT.func symbols (emscripten_console_*)
- * all use sig 'vp'; the pre-compiled trampoline-vp.wasm is bundled by wrangler
- * and loaded via globalThis.__phpWasmTrampolines before PHP instantiation.
- * apply-workerd-patches.py Patch 3 makes convertJsFunctionToWasm use the cache.
- *
- * Status: see docs/RESULTS.md Session 7.
+ * Status: see docs/RESULTS.md Session 8.
  * Apache-2.0. Our own code; no GPL or LGPL content.
  */
 
-import PHP from './build/php8.0-worker.mjs';
-import phpWasm from './build/php8.0-worker.mjs.wasm';
+import PHP82 from './build/php8.2-worker.mjs';
+import php82Wasm from './build/php8.2-worker.mjs.wasm';
+import PHP84 from './build/php8.4-worker.mjs';
+import php84Wasm from './build/php8.4-worker.mjs.wasm';
 import trampolineVP from './build/trampoline-vp.wasm';
 
-// Session 7 PHP script: two sequential fp_async_call invocations via D1.
+const RUNTIMES = {
+    '8.2': { factory: PHP82, wasm: php82Wasm },
+    '8.4': { factory: PHP84, wasm: php84Wasm },
+};
+const DEFAULT_VERSION = '8.4';
+
+// Session 7/8 PHP script: two sequential fp_async_call invocations via D1.
 // Each call suspends on a real async D1 query and resumes with the row JSON.
-// The JSON convention is the consumer's encoding — fp_async_call is opaque to it.
+// PHP_VERSION is echoed so the served runtime version is externally observable.
 const PHP_CODE = `<?php
 echo "before:\n";
 $r1 = fp_async_call('{"action":"query","sql":"SELECT value FROM config WHERE key=?","params":["greeting"]}');
 $r2 = fp_async_call('{"action":"query","sql":"SELECT value FROM config WHERE key=?","params":["farewell"]}');
 echo "after: " . $r1 . " / " . $r2 . "\n";
+echo "php: " . PHP_VERSION . "\n";
 `;
 
 export default {
-    async fetch(_request, env, _ctx) {
+    async fetch(request, env, _ctx) {
+        const requested = request.headers.get('X-PHP-Version') ?? DEFAULT_VERSION;
+        // Unknown versions fall back to the default rather than erroring.
+        const version = RUNTIMES[requested] ? requested : DEFAULT_VERSION;
         try {
-            return await runPhp(env);
+            return await runPhp(env, version);
         } catch (e) {
             console.error('[worker] error:', e);
             return new Response('Error: ' + String(e) + '\n' + (e?.stack || ''), {
@@ -52,14 +58,16 @@ export default {
     },
 };
 
-async function runPhp(env) {
+async function runPhp(env, version) {
+    const { factory, wasm } = RUNTIMES[version];
+    console.log(`[worker] serving PHP ${version}`);
     const stdoutBytes = [];
 
-    const mod = await PHP({
+    const mod = await factory({
         instantiateWasm(imports, receive) {
             globalThis.__phpWasmTrampolines = new Map([['vp', trampolineVP]]);
-            WebAssembly.instantiate(phpWasm, imports).then(
-                instance => receive(instance, phpWasm)
+            WebAssembly.instantiate(wasm, imports).then(
+                instance => receive(instance, wasm)
             ).catch(e => console.error('[worker] instantiate error:', e));
             return {};
         },
@@ -91,7 +99,7 @@ async function runPhp(env) {
 
     await mod.ccall('pib_init', 'number', ['string'], ['embed'], {async: true});
 
-    console.log('[worker] before: calling pib_run');
+    console.log(`[worker] before: calling pib_run (PHP ${version})`);
 
     await mod.ccall(
         'pib_run',
@@ -105,6 +113,9 @@ async function runPhp(env) {
 
     const output = new TextDecoder().decode(new Uint8Array(stdoutBytes));
     return new Response(output, {
-        headers: {'Content-Type': 'text/plain; charset=utf-8'},
+        headers: {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'X-PHP-Version-Served': version,
+        },
     });
 }

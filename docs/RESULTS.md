@@ -647,6 +647,117 @@ No patch file (no C or JS library changes).
 
 ---
 
+## Session 8 — PHP 8.2 + 8.4 dual build; multi-version Worker: PASS (2026-06-10)
+
+**PASS.** PHP 8.2.11 and 8.4.1 both build from the same patched pipeline with **zero
+source-patch deltas** (no `pib.c` changes, no glue-patch changes), both pass Node V8
+regression + suspend/resume, both serve the two-query D1 demo in workerd, and a single
+Worker deployment serves either version selected by the `X-PHP-Version` request header.
+See ADR-0018.
+
+### Build results
+
+| Artifact | PHP 8.2 | PHP 8.4 | (8.0 Session 5, reference) |
+|---|---|---|---|
+| `php*-worker.mjs.wasm` raw | 17,050,329 B | 17,580,702 B | 15,831,979 B |
+| `php*-worker.mjs` glue raw | 315,968 B | 315,555 B | 309,714 B |
+| `php*-node.mjs.wasm` raw | 17,050,329 B | 17,580,702 B | — |
+
+Exact PHP versions are the **pipeline-pinned** `PHP_VERSION_FULL` values (8.2 → 8.2.11,
+8.4 → 8.4.1), not the latest upstream patch releases — see ADR-0018 for why.
+
+**Key finding: the async primitive is version-agnostic in practice, not just in theory.**
+- `pib.c` compiled unmodified against 8.2 and 8.4 headers — `Z_PARAM_STRING`,
+  `RETVAL_STRING`, `ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX`, `PHP_FE`/`PHP_FE_END`,
+  and `zend_function_entry` are all unchanged across 8.0 → 8.4.
+- `library_fp_async.js` and the Makefile changes applied as-is.
+- All four workerd glue patches (`apply-workerd-patches.py`) found their target strings
+  unchanged in both new glue files — the Emscripten fork emits identical patterns.
+- The 6 GOT.func console symbols still all use sig `vp`; the single bundled
+  `trampoline-vp.wasm` suffices for both versions (open risk #3 stays closed).
+
+### Node V8 results (per version)
+
+```
+$ PHP_VERSION=8.2 node test-regression.mjs   → version: "8.2.11"  RESULT: PASS
+$ PHP_VERSION=8.2 node test-session3.mjs     → before:/after: 42 (×2)  RESULT: PASS
+   Cold 120.7 ms · Warm 76.0 ms · Exec 12.6 / 1.8 ms
+
+$ PHP_VERSION=8.4 node test-regression.mjs   → version: "8.4.1"  RESULT: PASS
+$ PHP_VERSION=8.4 node test-session3.mjs     → before:/after: 42 (×2)  RESULT: PASS
+   Cold 123.6 ms · Warm 77.6 ms · Exec 9.9 / 2.3 ms
+```
+
+Latency is in line with the 8.0 binary; no regression from the version bump.
+(`test-regression.mjs` / `test-session3.mjs` now take a `PHP_VERSION` env var and accept
+any `8.x.y` patch release of the requested branch.)
+
+### workerd per-version smoke tests
+
+Each version was verified standalone (temporary single-version entry point +
+`wrangler.smoke.toml`, both gitignored) before the multi-version step:
+
+```
+$ curl http://localhost:8791/        # smoke-8.2
+before:
+after: {"value":"hello from D1"} / {"value":"goodbye from D1"}
+php: 8.2.11
+
+$ curl http://localhost:8791/        # smoke-8.4
+before:
+after: {"value":"hello from D1"} / {"value":"goodbye from D1"}
+php: 8.4.1
+```
+
+Ordering markers in the wrangler console showed the same two complete suspend/resume
+cycles per request as Session 7, for both versions.
+
+### Multi-version Worker verification (single deployment)
+
+`worker/index.mjs` imports both glue modules and both wasm binaries statically; the
+fetch handler picks the runtime per request. The PHP script now also echoes
+`PHP_VERSION`, so the served version is externally observable.
+
+```
+$ curl -si http://localhost:8791/                          # default
+X-PHP-Version-Served: 8.4
+before:
+after: {"value":"hello from D1"} / {"value":"goodbye from D1"}
+php: 8.4.1
+
+$ curl -si -H "X-PHP-Version: 8.2" http://localhost:8791/  # header-selected
+X-PHP-Version-Served: 8.2
+before:
+after: {"value":"hello from D1"} / {"value":"goodbye from D1"}
+php: 8.2.11
+
+$ curl -si -H "X-PHP-Version: 7.4" http://localhost:8791/  # unknown → fallback
+X-PHP-Version-Served: 8.4
+php: 8.4.1
+```
+
+Wrangler console confirms the selection (`[worker] serving PHP 8.2` / `8.4` per request).
+Wrangler bundles both `.wasm` imports (AOT-compiled `WebAssembly.Module` objects) and
+both glue modules without any `wrangler.toml` changes — no explicit module rules needed.
+
+### Version-specific patch notes
+
+**None required.** No hunk of any session patch failed against the 8.2 or 8.4 trees;
+no PHP-internals API change affected `pib.c`. (The session patches modify the *pipeline*
+tree — `source/`, `Makefile`, env files — not the PHP source tree, so the only
+version-sensitive surface was `pib.c` compiling against new headers, and it did.)
+
+### Session 8 committed files
+
+- `patches/session8-multiversion.patch` — `.env_8.2.ci`/`.env_8.4.ci` deltas
+  (`WITH_LIBXML=static`, `WITH_ICONV=0`, `WITH_TIDY=static`, `WITH_VRZNO=0`)
+- `worker/index.mjs` — multi-version loader (header selection, version echo)
+- `worker/apply-workerd-patches.py` — patches every `php*-worker.mjs` in `worker/build/`
+- `.gitignore` — generalized artifact patterns
+- `docs/DECISIONS.md` — ADR-0018 (committed first, per protocol)
+
+---
+
 ## Asyncify vs JSPI comparison
 
 *Pending Session 5.* To be recorded:

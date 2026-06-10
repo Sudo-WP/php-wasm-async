@@ -25,12 +25,30 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Session 7 PASS (2026-06-09). D1 (Cloudflare serverless SQL) wired as second consumer
-of `fp_async_call`. PHP executes two sequential SQL queries mid-request via D1, suspending on
-each real async call and resuming with the query result. No rebuild required — only `wrangler.toml`
-and `worker/index.mjs` changed.
+**Phase:** Session 8 PASS (2026-06-10). PHP **8.2.11** and **8.4.1** both built from the
+same patched pipeline (ADR-0018; pipeline-pinned versions, not latest patch). Both pass
+Node V8 regression + suspend/resume and both serve the two-query D1 demo in workerd. The
+Worker now serves **both versions from a single deployment**, selected per request via the
+`X-PHP-Version` header (default 8.4, unknown values fall back to 8.4).
 
-**Session 7 result.** `curl http://localhost:8791/` returns
+**Session 8 result.** Zero source-patch deltas between 8.0 and 8.2/8.4: `pib.c`,
+`library_fp_async.js`, the Makefile changes, and all four workerd glue patches applied
+unchanged. The async primitive is version-agnostic in practice. Binary sizes:
+8.2 worker wasm 17,050,329 B; 8.4 worker wasm 17,580,702 B (8.0 was 15.8 MB).
+`curl` default → `php: 8.4.1`; `curl -H "X-PHP-Version: 8.2"` → `php: 8.2.11`; both
+return the full D1 two-query output.
+
+**Session 8 changes:**
+- `.circleci/.env_8.2.ci` / `.env_8.4.ci` (upstream files, in scratch checkout): same
+  mods as 8.0 (`WITH_LIBXML=static`, `WITH_ICONV=0`, `WITH_TIDY=static`) plus
+  `WITH_VRZNO=0` — committed as `patches/session8-multiversion.patch`.
+- `worker/index.mjs`: multi-version loader — both runtimes imported statically,
+  header-based selection, PHP echoes `PHP_VERSION`, `X-PHP-Version-Served` response header.
+- `worker/apply-workerd-patches.py`: patches every `php*-worker.mjs` in `worker/build/`.
+- `test-regression.mjs` / `test-session3.mjs` (scratch): take `PHP_VERSION` env var.
+- `.gitignore`: generalized to `worker/build/php*-worker.mjs*`.
+
+**Session 7 result (still valid).** `curl http://localhost:8791/` returns
 `before:\nafter: {"value":"hello from D1"} / {"value":"goodbye from D1"}\n`.
 Ordering markers confirm two complete suspend/resume cycles in sequence — the Asyncify stack
 unwind/rewind is stateless across calls. Node V8 regression: PASS (stub fallback, no rebuild).
@@ -81,6 +99,8 @@ unwind/rewind is stateless across calls. Node V8 regression: PASS (stub fallback
 - `docs/DECISIONS.md` — ADR-0017
 
 **What all sessions established (all true):**
+- Session 8 PASS: PHP 8.2.11 + 8.4.1 dual build; multi-version Worker serves either per
+  request (`X-PHP-Version` header). Zero source-patch deltas vs the 8.0 stack.
 - Session 7 PASS: D1 SQL consumer — two sequential queries from PHP mid-request, both PASS.
 - Session 6 PASS: real async host call — PHP suspends on `env.KV.get()`, resumes with stored value.
 - Session 5 PASS: Asyncify suspend/resume in workerd — `before:\nafter: 42\n`.
@@ -138,6 +158,11 @@ Source deltas for Sessions 2–5 are committed as patches.
    stack is stateless across calls. No rebuild. `curl http://localhost:8791/` →
    `before:\nafter: {"value":"hello from D1"} / {"value":"goodbye from D1"}\n` — PASS (2026-06-09).
 
+8. **[DONE] PHP 8.2 + 8.4 dual build; multi-version Worker.** Both versions built from
+   the same patched pipeline with zero source-patch deltas; both pass Node V8 + workerd
+   D1 verification. Single deployment serves either version via `X-PHP-Version` header
+   (default 8.4). Pipeline-pinned 8.2.11/8.4.1 (ADR-0018) — PASS (2026-06-10).
+
 **The PoC is complete.** The ADR-0005 success criterion is satisfied in workerd.
 ADR-0006 is fully satisfied. The Asyncify suspend/resume primitive is proven in
 both Node V8 and Cloudflare Workers / workerd, against real async host operations (KV and D1).
@@ -171,25 +196,30 @@ both Node V8 and Cloudflare Workers / workerd, against real async host operation
 
 ## Next action
 
-**Session 7 PASS.** D1 SQL consumer wired. Two sequential queries from PHP mid-request,
-both suspend/resume correctly. `fp_async_call` remains store-agnostic (2026-06-09).
+**Session 8 PASS.** Dual PHP 8.2.11 + 8.4.1 support; multi-version Worker loader with
+header-based selection (2026-06-10). The 8.0.30 baseline is retired (ADR-0018).
 
-**Potential next sessions (optional — the PoC + productization demo is complete):**
+**Potential next sessions (optional):**
 
-1. **PHP version bump.** Port to PHP 8.2 or 8.3 (8.0 is end-of-life). The build structure
-   is the same; only the version string, source tarball, and potentially the PHP configure
-   flags need updating. This is likely the highest-priority next step for real-world adoption.
+1. **Binary size reduction.** Strip unused extensions from `.env_8.2.ci`/`.env_8.4.ci`
+   to shrink each wasm (currently ~17 MB raw) below 10 MB, improving cold-start latency.
+   Note both binaries now ship in one deployment — combined bundle size matters for
+   Workers' deployment limits.
 
-2. **JSPI port (optimization).** Rebuild with JSPI + `WITH_LIBXML=static` to get a
+2. **WordPress bootstrap.** Attempt to boot a minimal WordPress against the D1 consumer
+   via the async primitive — the first real-application test of sequential suspension
+   at scale.
+
+3. **JSPI port (optimization).** Rebuild with JSPI + `WITH_LIBXML=static` to get a
    smaller binary (drops Asyncify instrumentation) and lower per-call overhead. The
    trampoline fix applies equally to JSPI since MAIN_MODULE=1 remains. Compare binary
    sizes and latency in RESULTS.md. Use `WebAssembly.Suspending`/`WebAssembly.promising`
    in `worker/index.mjs` instead of `ccall({async: true})`.
 
-3. **R2 / Durable Objects consumers.** Wire R2 (object storage) or Durable Objects as
+4. **R2 / Durable Objects consumers.** Wire R2 (object storage) or Durable Objects as
    additional consumers of `fp_async_call`. Each is a `mod.hostAsyncCall` dispatch case
    in `worker/index.mjs`. No rebuild needed; JSON payload convention already supports
    arbitrary action dispatch.
 
-4. **Binary size reduction.** Strip unused extensions from `.env_8.0.ci` to shrink
-   the wasm below 10 MB raw, improving cold-start latency.
+5. **PHP patch-version bump.** Move `PHP_VERSION_FULL` pins (8.2.11 → latest 8.2.x,
+   8.4.1 → latest 8.4.x) with a dedicated validation pass — a new ADR per ADR-0018.

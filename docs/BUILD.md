@@ -553,6 +553,114 @@ Ordering markers in wrangler console confirm two suspend/resume cycles per reque
 [fp_async_call] wasm resumed, returning {"value":"goodbye from D1"}  ← resume #2
 ```
 
+### Session 8 — PHP 8.2 + 8.4 dual build; multi-version Worker (validated 2026-06-10)
+
+**Goal:** build PHP 8.2 and 8.4 from the same patched pipeline, validate both, and serve
+both versions from a single Worker deployment selected per request. See ADR-0018.
+
+**Exact PHP versions pulled.** The pipeline Makefile pins `PHP_VERSION_FULL` per branch:
+`PHP_VERSION=8.2` builds **8.2.11**, `PHP_VERSION=8.4` builds **8.4.1**. These pins — not
+the latest patch releases — are what the pipeline's per-version source patches are
+validated against (ADR-0018; ADR-0007 don't-float principle).
+
+**Part 1: env files.** Upstream ships `.circleci/.env_8.2.ci` and `.env_8.4.ci`; they
+differ from `.env_8.0.ci` only in the version string and `WITH_VRZNO=1`. Apply
+`patches/session8-multiversion.patch`, which makes the same modifications validated in
+Sessions 5–6, plus VRZNO parity:
+
+- `WITH_LIBXML=1` → `WITH_LIBXML=static` (ADR-0014/0015)
+- `WITH_ICONV=1` → `WITH_ICONV=0` (ADR-0011)
+- `WITH_TIDY=1` → `WITH_TIDY=static` (tidy must match libxml's mode)
+- `WITH_VRZNO=1` → `WITH_VRZNO=0` (browser JS-interop ext; parity with the 8.0 set)
+
+**Part 2: build both versions.** From the patched checkout (sessions 2, 3,
+iconv-resolution, 5, 6, 8 applied). The Session 5 Makefile sentinel
+(`PHP_CONFIGURE_DEPS+= lib/lib/libxml2.a`) and Session 2 `EXTRA_FLAGS` are
+version-independent and already in place. For each version (shown for 8.2;
+repeat with 8.4):
+
+```bash
+cd ~/scratch/php-wasm-upstream
+
+# Clear the stale configure cache before EACH version build (same reason as
+# Session 5: a cache from another version causes configure failures)
+docker run --rm -v $(pwd):/src seanmorris/php-emscripten-builder:latest \
+    bash -c "rm -f /src/.cache/config-cache /src/third_party/php8.2-src/configured"
+
+make PHP_VERSION=8.2 ENV_FILE=.circleci/.env_8.2.ci worker-mjs
+make PHP_VERSION=8.2 ENV_FILE=.circleci/.env_8.2.ci node-mjs
+```
+
+The PHP source tarball for each pinned version is fetched automatically. Building
+multiple versions in one checkout is fine — each PHP tree lives in
+`third_party/php<ver>-src/` and the shared `lib/` archives are version-independent.
+
+**Version-specific patch notes: none.** `pib.c` compiled unmodified against both 8.2
+and 8.4 headers (`Z_PARAM_STRING` / `RETVAL_STRING` / `PHP_FE` / `zend_function_entry`
+are stable across 8.0 → 8.4). No patch hunk failed; no rejects.
+
+**Part 3: Node V8 verification per version.** The test scripts take `PHP_VERSION`
+(default `8.0`) and accept any `8.x.y` of the requested branch:
+
+```bash
+PHP_VERSION=8.2 node test-regression.mjs   # version: "8.2.11" — PASS
+PHP_VERSION=8.2 node test-session3.mjs     # before:/after: 42 — PASS
+PHP_VERSION=8.4 node test-regression.mjs   # version: "8.4.1"  — PASS
+PHP_VERSION=8.4 node test-session3.mjs     # before:/after: 42 — PASS
+```
+
+**Part 4: copy artifacts and apply workerd patches.** `apply-workerd-patches.py` now
+patches **every** `php*-worker.mjs` it finds in `worker/build/` (idempotent):
+
+```bash
+cp ~/scratch/php-wasm-upstream/packages/php-wasm/php8.2-worker.mjs{,.wasm} \
+   ~/scratch/php-wasm-upstream/packages/php-wasm/php8.4-worker.mjs{,.wasm} \
+   ~/php-wasm-async/worker/build/
+python3 ~/php-wasm-async/worker/apply-workerd-patches.py
+```
+
+All four glue patches found their target strings unchanged in both new glue files.
+
+**Part 5: multi-version Worker loader.** `worker/index.mjs` imports both runtimes
+**statically** — wrangler bundles and AOT-compiles every `.wasm` import at deploy time
+(the property the trampoline fix relies on), and glue `.mjs` files are ordinary ESM
+imports resolved at bundle time. Dynamic `import()` of glue at request time is not part
+of wrangler's bundling model, so selection happens by choosing which already-imported
+factory + wasm module to instantiate:
+
+```js
+import PHP82 from './build/php8.2-worker.mjs';
+import php82Wasm from './build/php8.2-worker.mjs.wasm';
+import PHP84 from './build/php8.4-worker.mjs';
+import php84Wasm from './build/php8.4-worker.mjs.wasm';
+
+const RUNTIMES = {
+    '8.2': { factory: PHP82, wasm: php82Wasm },
+    '8.4': { factory: PHP84, wasm: php84Wasm },
+};
+const version = RUNTIMES[request.headers.get('X-PHP-Version')] ? ... : '8.4';
+```
+
+**No `wrangler.toml` changes were needed** for the second binary: wrangler picks up all
+`.wasm` and `.mjs` imports from the module graph automatically (verified with wrangler
+4.96.0 — both binaries bundle and serve without explicit module rules).
+
+**Part 6: verify in workerd.**
+
+```bash
+cd ~/php-wasm-async
+wrangler dev --local --port 8791 &
+curl http://localhost:8791/                            # → php: 8.4.1 (default)
+curl -H "X-PHP-Version: 8.2" http://localhost:8791/    # → php: 8.2.11
+# Both return: before:\nafter: {"value":"hello from D1"} / {"value":"goodbye from D1"}
+# plus a "php: <version>" line; the X-PHP-Version-Served response header and the
+# wrangler console ("[worker] serving PHP 8.2/8.4") confirm the selection.
+```
+
+Per-version standalone smoke tests (before the multi-version step) used a temporary
+single-version entry (`worker/build/smoke-<ver>.mjs`) + `wrangler.smoke.toml`, both
+gitignored and removed afterward.
+
 ## Known fragile steps
 
 - **Exhaustive suspendable-imports list.** *Not a problem on this pipeline*
