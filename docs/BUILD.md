@@ -16,7 +16,7 @@ How to reproduce the runtime build.
 | Component       | Version  | Notes                                              |
 |-----------------|----------|----------------------------------------------------|
 | Emscripten SDK  | 3.1.68 (seanmorris fork `sm-updates`, on `emscripten/emsdk:3.1.67` base) | **Corrected in Session 1 (ADR-0007).** The reference pipeline replaces stock Emscripten with this fork; stock 4.0.19 is *not* what it validates against. Covers both Asyncify and JSPI (JSPI needs ≥ 3.1.61). |
-| PHP source      | 8.0.30   | Initial baseline. Designed so a later bump to a supported branch is a version-string change. |
+| PHP source      | 8.2.11 + 8.4.1 (dual; Sessions 1–7 used 8.0.30) | **Updated in Session 8 (ADR-0018).** The pipeline Makefile pins `PHP_VERSION_FULL` per branch (8.2 → 8.2.11, 8.4 → 8.4.1); these pinned versions — not the latest patch releases — are what the build pulls. 8.0.30 was the initial baseline (ADR-0004) and remains documented in the session history below. |
 | Node.js         | LTS      | For running and benchmarking the binary outside the serverless runtime. |
 | Node.js (JSPI)  | 24-class | A build able to run `--experimental-wasm-jspi`, for the JSPI smoke test only. |
 | Docker          | current  | The reference build pipeline is container-based.   |

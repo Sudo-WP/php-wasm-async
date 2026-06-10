@@ -10,6 +10,74 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0018 — Session 8: dual PHP 8.2 + 8.4 build; multi-version Worker loader with header-based selection
+**Date:** 2026-06-10 · **Status:** Accepted · **Supersedes:** ADR-0004's PHP 8.0.30 baseline (the 8.0.30 *historical* results stand; 8.0.30 is no longer the build target)
+
+**Decision.** Build PHP **8.2** and **8.4** WebAssembly binaries from the same patched
+pipeline that produced the Session 1–6 PHP 8.0.30 binaries, validate both (Node V8
+regression + workerd D1 smoke test), and update the Worker to serve **both versions from
+a single deployment**, selecting the binary per request via the `X-PHP-Version` header
+(default: `8.4`).
+
+**Why both versions.**
+- **8.2** — broadest compatibility floor for existing PHP applications and plugins that
+  lag on 8.3+/8.4 support; still in security-support upstream.
+- **8.4** — current stable branch; future-proofs the runtime and is the sensible default
+  for new deployments.
+- 8.0.30 (EOL since 2023) was only ever a continuity baseline (ADR-0004 said so
+  explicitly); with the PoC complete it has served its purpose.
+
+**Exact patch versions: pipeline-pinned, not "latest".** The seanmorris pipeline pins
+`PHP_VERSION_FULL` per branch in its Makefile: **8.2 → 8.2.11** and **8.4 → 8.4.1**.
+These — not the latest upstream patch releases — are what `PHP_VERSION=8.2/8.4` builds,
+because the pipeline's per-version source patches (`third_party/php*-src/patched`) are
+validated against those tags. Consistent with ADR-0007's principle (build what the
+reference pipeline validates; don't float), Session 8 builds the pinned versions.
+Bumping `PHP_VERSION_FULL` to a newer patch release is a separate, later decision with
+its own validation pass.
+
+**Env files.** Upstream ships `.circleci/.env_8.2.ci` and `.env_8.4.ci`; they differ
+from `.env_8.0.ci` only in the version string and `WITH_VRZNO=1`. Session 8 applies the
+same three modifications validated in Sessions 5–6 to both files — `WITH_ICONV=0`
+(ADR-0011), `WITH_LIBXML=static` + `WITH_TIDY=static` (ADR-0014/0015) — and sets
+`WITH_VRZNO=0` for parity with the validated 8.0 extension set (vrzno is a
+browser-oriented JS-interop extension; not needed for the workerd target and would add
+an unvalidated variable).
+
+**Multi-version Worker loader.** `worker/index.mjs` imports both wasm binaries and both
+Emscripten glue modules **statically** (wrangler bundles and AOT-compiles all `.wasm`
+imports at deploy time — the same property the trampoline fix relies on, ADR-0015;
+dynamic `import()` of glue at request time is not part of wrangler's supported bundling
+model). Version selection happens at request time by choosing which already-imported
+module factory + wasm module to instantiate:
+
+```js
+const v = request.headers.get('X-PHP-Version') ?? '8.4';
+```
+
+Unknown/absent header values fall back to the default (`8.4`) rather than erroring —
+the Worker always serves a supported runtime.
+
+**Invariants carried forward.** `fp_async_call`, `pib.c`, and `library_fp_async.js` are
+expected to be version-agnostic; no changes to the async primitive are part of this
+decision. If a PHP-internals API change in 8.2/8.4 forces a `pib.c` delta, it is
+documented as a named finding in BUILD.md/RESULTS.md, kept minimal, and must not
+introduce store-specific code (ADR-0016 invariant).
+
+**Alternatives considered.**
+- Single version (8.4 only): simpler, but loses the 8.2 compatibility floor that
+  real-world PHP applications need; serving both from one deployment is the actual
+  capability being proven (per-site PHP version selection).
+- 8.3 instead of 8.2: 8.3 is neither the compatibility floor nor the current branch;
+  it adds a third build for no additional coverage.
+- Latest patch releases (8.2.28+/8.4.x-latest) via `PHP_VERSION_FULL` override:
+  rejected for this session — floats the source against unvalidated pipeline patches
+  (ADR-0007 principle). Revisit as its own decision if a security fix demands it.
+- Version selection via URL path or query parameter: a header keeps the URL space
+  untouched for the eventual application (WordPress routes own the path space).
+
+---
+
 ## ADR-0017 — Session 7: D1 (SQL) as second consumer; JSON as the consumer-owned payload encoding
 **Date:** 2026-06-09 · **Status:** Accepted
 

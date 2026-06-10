@@ -93,8 +93,9 @@ unwind/rewind is stateless across calls. Node V8 regression: PASS (stub fallback
 - License: **Apache-2.0**, clean-derivation path.
 - Lineage: derive from the **Apache-2.0** ancestor pipeline, not GPL Playground packages.
 - Suspension mechanism: **Asyncify** (proven in Node V8 AND workerd). ADR-0002 complete.
-- Toolchain: **PHP 8.0.30**; Emscripten = **seanmorris fork 3.1.68 (`sm-updates`)**,
-  not stock 4.0.19 (ADR-0007 supersedes ADR-0004).
+- Toolchain: **PHP 8.2.11 + 8.4.1 dual build** (ADR-0018 supersedes the 8.0.30
+  baseline; pipeline-pinned patch versions, not latest); Emscripten = **seanmorris
+  fork 3.1.68 (`sm-updates`)**, not stock 4.0.19 (ADR-0007 supersedes ADR-0004).
 - PoC scope and success criteria: ADR-0005. Kill criterion: ADR-0006.
 
 Build artifacts (not committed; `*.wasm` and `worker/build/*.mjs*` gitignored) live in the
