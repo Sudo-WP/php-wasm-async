@@ -758,6 +758,128 @@ version-sensitive surface was `pib.c` compiling against new headers, and it did.
 
 ---
 
+## Session 9 — binary size reduction: PASS, with a major inventory finding (2026-06-10)
+
+**Result.** Stripping the safely-removable static extensions (tidy + libtidy, calendar,
+pdo_pglite) cut each worker binary by ~273 KB gzipped (−6.2%). Final sizes
+(`gzip -9`): **8.2 = 3,977,584 B (3.79 MiB)**, **8.4 = 4,139,775 B (3.95 MiB)**,
+combined **8,117,359 B (7.74 MiB)** — comfortably under the 10 MB (Paid plan)
+Cloudflare limit with ~2.3 MiB headroom. The ≤3.5 MiB-per-binary target was **not**
+reached: the remaining mass is PHP core under whole-program Asyncify plus libxml2,
+neither strippable without violating a standing decision (ADR-0008, ADR-0014). All
+verification passes on both versions.
+
+### The finding that reframed the session: the static/dynamic split
+
+The pipeline is dynamic-by-default: for most packages `WITH_X=1` means *dynamic side
+module*, exactly as ADR-0011 found for iconv. Ground truth from `get_loaded_extensions()`
+and the final link command (which contains only `libxml2.a` + `libtidy.a` beyond PHP):
+
+- **Statically in the worker binary (Session 8 state):** Core, date, pcre, json, hash,
+  SPL, standard, random, Reflection, bcmath, calendar, ctype, exif, filter, session,
+  tokenizer, PDO, pdo_pglite, pib, libxml, tidy.
+- **Side modules, NOT in the binary** (and not loadable in workerd — runtime wasm
+  compilation is blocked, ADR-0015): mbstring, openssl, gd, dom, xml, simplexml, intl,
+  sqlite3/pdo_sqlite, zip, zlib, yaml, phar (+ their C libraries: oniguruma, OpenSSL,
+  freetype/libpng/libjpeg/libwebp, ICU, libyaml, libzip).
+- **Not in the pipeline at all:** mysqli/mysqlnd, curl (`WITH_NETWORKING=0`), fileinfo,
+  soap, ftp, sockets, gettext, shmop, sysv*, pspell, enchant, gmp — most of Session 9's
+  intended "strip candidates" were never present.
+
+**Consequence (named finding): the WordPress MUST-KEEP extension floor is not met by
+these binaries and never was** — in any session to date. The live sanity line now in the
+demo output makes it visible per request: `ext: - - - - - bc` (mysqli, gd, curl,
+mbstring, openssl absent; bcmath present). Bringing the WP floor into the static link
+(mbstring+oniguruma, openssl, gd+image libs, dom/xml/simplexml, sqlite/pdo_sqlite, zip,
+fileinfo at minimum; mysqli and curl need `WITH_NETWORKING` or shims) is a dedicated
+future session and will **grow** the binary substantially — Session 9's sizes are the
+floor of the *current* capability set, not of a WP-ready one.
+
+### Extension decision table (static set only — side modules cost 0 bytes in-binary)
+
+| Extension (static) | Decision | Reason |
+|---|---|---|
+| bcmath | keep | WP/WooCommerce money math (MUST KEEP) |
+| calendar | **strip** | niche calendar conversions; WP unused |
+| ctype | keep | WP requirement (cheap) |
+| exif | keep | WP recommended (image metadata) |
+| filter | keep | WP requirement |
+| json, hash, pcre, SPL, standard, date, random, Reflection | keep | PHP core; not removable |
+| session | keep | WP login/auth paths |
+| tokenizer | keep | WP requirement (plugin editor, sitemaps) |
+| PDO | keep | base for the future sqlite/D1 driver path |
+| pdo_pglite | **strip** | Postgres-in-wasm driver; pipeline default `=1` crept back in Session 8 (8.0 env had it 0); D1 path unused |
+| pib | keep | our embed/runtime extension (`fp_async_call`) |
+| libxml (`static`) | keep | required to avoid the GOT/addFunction init blocker (ADR-0014/0015) |
+| tidy (`static`) | **strip** | WP unused; Session 5 chose `static` only because `=1`(dynamic) conflicted with `WITH_LIBXML=static`; `WITH_TIDY=0` carries **no libxml coupling** (verified in tidy's `static.mak`) — the Session 5 constraint is mode-matching, not presence |
+| readline | n/a | never present (GPL, excluded per ADR-0003) — verified |
+| vrzno | n/a | `WITH_VRZNO=0` since Session 8 — verified absent |
+
+### Size progression (worker-mjs, `gzip -9`)
+
+| Step | 8.4 raw | 8.4 gz | Δ gz | 8.2 raw | 8.2 gz |
+|---|---|---|---|---|---|
+| Session 8 baseline | 17,580,702 | 4,414,500 | — | 17,050,329 | 4,250,384 |
+| Phase 1: −calendar −pdo_pglite | 17,533,688 | 4,403,552 | −10,948 | (not built separately) | |
+| Phase 2: −tidy −libtidy.a | **16,462,783** | **4,139,775** | −263,777 | **15,934,663** | **3,977,584** |
+
+Totals: 8.4 −1,117,919 B raw (−6.4%) / −274,725 B gz (−6.2%); 8.2 −1,115,666 B raw /
+−272,800 B gz. Combined bundle: 8,664,884 → **8,117,359 B gz**. The 8.2 phase deltas
+were not measured separately (final flag set applied in one rebuild, per the
+work-on-8.4-first method).
+
+### Phase 3 — the measured cost of intl: 0 bytes in the worker binary
+
+intl was **already absent**: `WITH_INTL=1` builds it as a side module. Evidence:
+- `get_loaded_extensions()` does not list intl (any session, any version);
+- the final worker link command contains no ICU archive; the PHP build's `SKIP_LIBS`
+  explicitly excludes `-licuio -licui18n -licuuc -licudata`;
+- per the ADR-0011 precedent (iconv), side-module flags do not alter the main binary —
+  no throwaway build was needed.
+
+The "intl decision" is therefore moot at current capability: stripping it saves 0 B.
+The relevant future number is the *cost of adding* `WITH_INTL=static` (ICU is tens of
+MB unstripped; likely several MB gzipped) when the WP-floor session happens — that
+session must measure it.
+
+### Verification (final stripped binaries, both versions)
+
+Node V8 (`PHP_VERSION=8.2|8.4`): regression (`8.2.11` / `8.4.1`) PASS ×2;
+suspend/resume stub `before:/after: 42` PASS ×2. Loaded extensions match the intended
+static set exactly (calendar, pdo_pglite, tidy gone; nothing else changed).
+
+workerd multi-version (single deployment, final binaries):
+
+```
+$ curl http://localhost:8791/                          $ curl -H "X-PHP-Version: 8.2" ...
+before:                                                before:
+after: {"value":"hello from D1"} / {"value":...}       after: {"value":"hello from D1"} / {"value":...}
+php: 8.4.1                                             php: 8.2.11
+ext: - - - - - bc                                      ext: - - - - - bc
+```
+
+Two suspend/resume cycles per request on both versions; no trampoline regression (the
+GOT.func symbol set still resolves with the single `vp` trampoline — open risk #3
+unchanged by the extension-set change).
+
+### What remains in the binary (the floor, and the levers left)
+
+~16 MB raw ≈ PHP core + the small WP-floor static extensions, ×(whole-program Asyncify
+instrumentation, ADR-0008) + libxml2.a. Remaining size levers, all out of Session 9
+scope: **JSPI** (drops Asyncify instrumentation entirely — the largest single lever),
+`ASYNCIFY_ONLY` curation (re-introduces the iterative-crash cost ADR-0008 rejected),
+`OPTIMIZE=z`, and one-Worker-per-version deployment (halves per-Worker size; loses
+single-deployment selection).
+
+### Session 9 committed files
+
+- `patches/session9-size-reduction.patch` — env deltas on top of session8 state
+- `worker/index.mjs` — extension sanity line in the demo PHP
+- `NOTICE` — libtidy no longer statically linked (attribution kept for S5–S8 artifacts)
+- `docs/DECISIONS.md` — ADR-0019 (committed first, per protocol)
+
+---
+
 ## Asyncify vs JSPI comparison
 
 *Pending Session 5.* To be recorded:

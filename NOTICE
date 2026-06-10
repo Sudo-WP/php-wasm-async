@@ -45,9 +45,12 @@ Statically-linked libraries (Session 1 baseline config, WITH_ICONV=0):
   [*]  OpenSSL 1.1.1 uses the legacy dual OpenSSL/SSLeay license, NOT the
        Apache-2.0 license that begins with OpenSSL 3.0. Both are permissive.
 
-  [**] tidy-html5 (libtidy): statically linked from Session 5 onward
-       (WITH_TIDY=static). The W3C Software License (HTMLTIDY) is a
-       permissive, BSD-style, no-copyleft license. License text at:
+  [**] tidy-html5 (libtidy): statically linked Sessions 5–8
+       (WITH_TIDY=static). From Session 9 onward, WITH_TIDY=0 — libtidy is
+       NO LONGER present in the binary or the distribution (ADR-0019; size
+       reduction; WordPress does not use ext/tidy). The attribution is kept
+       here for the historical Session 5–8 artifacts. The W3C Software
+       License (HTMLTIDY) is a permissive, BSD-style, no-copyleft license:
        https://github.com/htacg/tidy-html5/blob/next/README/LICENSE.md
        SPDX reference: https://spdx.org/licenses/HTMLTIDY.html
 

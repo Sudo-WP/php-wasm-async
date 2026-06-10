@@ -25,10 +25,29 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Session 8 PASS (2026-06-10). PHP **8.2.11** and **8.4.1** both built from the
+**Phase:** Session 9 PASS (2026-06-10). Binary size reduction via extension stripping
+(ADR-0019): `WITH_TIDY=0` (+libtidy.a out), `WITH_CALENDAR=0`, `WITH_PDO_PGLITE=0` on
+both versions. Final `gzip -9` sizes: **8.2 = 3,977,584 B (3.79 MiB)**, **8.4 =
+4,139,775 B (3.95 MiB)**; combined **7.74 MiB — the two-binary single-Worker deployment
+fits the 10 MB Paid limit with ~2.3 MiB headroom** (Free-plan 3 MB is out of reach per
+binary). The ≤3.5 MiB/binary target was not met: the remaining mass is PHP core under
+whole-program Asyncify + libxml2 — the strippable surface is exhausted; the big lever
+left is JSPI.
+
+**Session 9 key finding (static/dynamic split).** The pipeline is dynamic-by-default:
+`WITH_X=1` builds a *side module* workerd cannot load. The worker binary only ever
+contained the small `--enable-*` static set + libxml (+tidy until now). Consequences:
+(a) **intl costs 0 B in the binary** — it was never in it (the "strip intl?" question is
+moot until something *adds* it); (b) **the WordPress MUST-KEEP extension floor (mysqli,
+curl, gd, mbstring, openssl, dom, sqlite, zip, fileinfo) is NOT met and never was** —
+the demo now prints a live sanity line `ext: - - - - - bc` showing it. Making those
+static is a dedicated future session and will grow the binary; mysqli/curl additionally
+need `WITH_NETWORKING` or shims. See RESULTS Session 9 for the full decision table.
+
+**Session 8 state (still true).** PHP **8.2.11** and **8.4.1** both built from the
 same patched pipeline (ADR-0018; pipeline-pinned versions, not latest patch). Both pass
 Node V8 regression + suspend/resume and both serve the two-query D1 demo in workerd. The
-Worker now serves **both versions from a single deployment**, selected per request via the
+Worker serves **both versions from a single deployment**, selected per request via the
 `X-PHP-Version` header (default 8.4, unknown values fall back to 8.4).
 
 **Session 8 result.** Zero source-patch deltas between 8.0 and 8.2/8.4: `pib.c`,
@@ -99,6 +118,9 @@ unwind/rewind is stateless across calls. Node V8 regression: PASS (stub fallback
 - `docs/DECISIONS.md` — ADR-0017
 
 **What all sessions established (all true):**
+- Session 9 PASS: tidy/calendar/pdo_pglite stripped; 8.2 = 3.79 MiB gz, 8.4 = 3.95 MiB gz,
+  combined 7.74 MiB — fits the 10 MB Paid limit. Static/dynamic split documented; WP
+  extension floor finding recorded; intl in-binary cost = 0 B.
 - Session 8 PASS: PHP 8.2.11 + 8.4.1 dual build; multi-version Worker serves either per
   request (`X-PHP-Version` header). Zero source-patch deltas vs the 8.0 stack.
 - Session 7 PASS: D1 SQL consumer — two sequential queries from PHP mid-request, both PASS.
@@ -163,6 +185,12 @@ Source deltas for Sessions 2–5 are committed as patches.
    D1 verification. Single deployment serves either version via `X-PHP-Version` header
    (default 8.4). Pipeline-pinned 8.2.11/8.4.1 (ADR-0018) — PASS (2026-06-10).
 
+9. **[DONE] Binary size reduction.** Strippable static surface exhausted (tidy+libtidy,
+   calendar, pdo_pglite): −6.2% gz per binary; combined 7.74 MiB gz fits the Paid limit.
+   Static/dynamic split finding: most WITH_X=1 extensions are side modules, never in the
+   binary — WP extension floor not met (named finding); intl in-binary cost 0 B
+   (ADR-0019) — PASS (2026-06-10).
+
 **The PoC is complete.** The ADR-0005 success criterion is satisfied in workerd.
 ADR-0006 is fully satisfied. The Asyncify suspend/resume primitive is proven in
 both Node V8 and Cloudflare Workers / workerd, against real async host operations (KV and D1).
@@ -196,30 +224,32 @@ both Node V8 and Cloudflare Workers / workerd, against real async host operation
 
 ## Next action
 
-**Session 8 PASS.** Dual PHP 8.2.11 + 8.4.1 support; multi-version Worker loader with
-header-based selection (2026-06-10). The 8.0.30 baseline is retired (ADR-0018).
+**Session 9 PASS.** Size reduced −6.2% gz per binary; **two-binary single-Worker
+deployment fits the 10 MB Paid limit (7.74 MiB combined, ~2.3 MiB headroom)** — the
+one-Worker-per-version split (option b) is NOT forced by size today. Per-binary
+Free-plan fit (3 MB) is out of reach without JSPI. intl remains a zero-cost lever
+only in the sense that it's already absent; the real future cost is *adding* it.
 
-**Potential next sessions (optional):**
+**Potential next sessions (priority-ordered by the Session 9 findings):**
 
-1. **Binary size reduction.** Strip unused extensions from `.env_8.2.ci`/`.env_8.4.ci`
-   to shrink each wasm (currently ~17 MB raw) below 10 MB, improving cold-start latency.
-   Note both binaries now ship in one deployment — combined bundle size matters for
-   Workers' deployment limits.
+1. **WordPress extension floor (static link).** The blocking gap for the WordPress
+   target: bring mbstring(+oniguruma), openssl, dom/xml/simplexml, sqlite3/pdo_sqlite,
+   zip, gd(+image libs), fileinfo into the static link (`WITH_X=static` where the
+   package supports it — libxml proved the pattern), and decide mysqli/curl
+   (`WITH_NETWORKING` or shim at the wp-db layer). Each addition grows the binary —
+   measure gz per extension and re-check the 10 MB combined budget; this may be what
+   finally forces JSPI or per-version Workers.
 
-2. **WordPress bootstrap.** Attempt to boot a minimal WordPress against the D1 consumer
-   via the async primitive — the first real-application test of sequential suspension
-   at scale.
+2. **JSPI port (the big size lever).** Drops whole-program Asyncify instrumentation —
+   the dominant remaining mass after Session 9. Use `WebAssembly.Suspending`/
+   `WebAssembly.promising`; trampoline fix still applies (MAIN_MODULE=1 remains).
+   Re-examine suspendable-frame constraints (ADR-0008 caveat).
 
-3. **JSPI port (optimization).** Rebuild with JSPI + `WITH_LIBXML=static` to get a
-   smaller binary (drops Asyncify instrumentation) and lower per-call overhead. The
-   trampoline fix applies equally to JSPI since MAIN_MODULE=1 remains. Compare binary
-   sizes and latency in RESULTS.md. Use `WebAssembly.Suspending`/`WebAssembly.promising`
-   in `worker/index.mjs` instead of `ccall({async: true})`.
+3. **WordPress bootstrap.** Boot a minimal WordPress against the D1 consumer —
+   blocked in practice on (1).
 
-4. **R2 / Durable Objects consumers.** Wire R2 (object storage) or Durable Objects as
-   additional consumers of `fp_async_call`. Each is a `mod.hostAsyncCall` dispatch case
-   in `worker/index.mjs`. No rebuild needed; JSON payload convention already supports
-   arbitrary action dispatch.
+4. **R2 / Durable Objects consumers.** Additional `mod.hostAsyncCall` dispatch cases;
+   no rebuild needed.
 
-5. **PHP patch-version bump.** Move `PHP_VERSION_FULL` pins (8.2.11 → latest 8.2.x,
-   8.4.1 → latest 8.4.x) with a dedicated validation pass — a new ADR per ADR-0018.
+5. **PHP patch-version bump.** Move `PHP_VERSION_FULL` pins with a dedicated
+   validation pass — a new ADR per ADR-0018.

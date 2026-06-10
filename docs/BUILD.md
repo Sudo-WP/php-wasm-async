@@ -661,6 +661,55 @@ Per-version standalone smoke tests (before the multi-version step) used a tempor
 single-version entry (`worker/build/smoke-<ver>.mjs`) + `wrangler.smoke.toml`, both
 gitignored and removed afterward.
 
+### Session 9 — binary size reduction (validated 2026-06-10)
+
+**Goal:** shrink each worker wasm for Cloudflare's compressed-size limits (3 MB Free /
+10 MB Paid, measured gzipped). See ADR-0019 — including the static/dynamic split
+finding that reframed the session (most `WITH_X=1` extensions are side modules and were
+never in the worker binary; the strippable static surface is small).
+
+**Flag changes** (both `.env_8.2.ci` and `.env_8.4.ci`; committed as
+`patches/session9-size-reduction.patch`, applied on top of the session8 patch):
+
+- `WITH_CALENDAR=1` → `WITH_CALENDAR=0`
+- `WITH_TIDY=static` → `WITH_TIDY=0`
+- `WITH_PDO_PGLITE=0` added (the pipeline's `pre.mak` defaults it to **1**; the 8.0 env
+  had zeroed it, upstream 8.2/8.4 envs do not — it crept back in Session 8)
+
+**The tidy/libxml mode outcome.** `WITH_TIDY=0` works fine with `WITH_LIBXML=static`.
+The Session 5 coupling (`$(error)` in `packages/tidy/static.mak`) only constrains
+tidy's *mode* to match libxml's when tidy is enabled — `static` requires
+`WITH_LIBXML=static`, `dynamic` requires libxml dynamic — but `0` has no constraint.
+Session 5 chose `static` because the env then had `WITH_TIDY=1` (=dynamic), which
+conflicted with static libxml; dropping tidy entirely was always allowed. libtidy.a is
+out of the link; NOTICE updated.
+
+**Rebuild** (per version; the configure flags changed, so clear the cache first —
+same as every session since 5):
+
+```bash
+cd ~/scratch/php-wasm-upstream
+docker run --rm -v $(pwd):/src seanmorris/php-emscripten-builder:latest \
+    bash -c "rm -f /src/.cache/config-cache /src/third_party/php8.4-src/configured"
+make PHP_VERSION=8.4 ENV_FILE=.circleci/.env_8.4.ci worker-mjs
+make PHP_VERSION=8.4 ENV_FILE=.circleci/.env_8.4.ci node-mjs
+# repeat with 8.2
+```
+
+Then copy artifacts, `apply-workerd-patches.py`, and verify exactly as in Session 8
+Parts 4–6. The demo PHP now also prints an extension sanity line
+(`ext: - - - - - bc` — see RESULTS Session 9 for why most entries are absent).
+
+**Measure** (the governing metric is gzipped size):
+
+```bash
+cd ~/scratch/php-wasm-upstream/packages/php-wasm
+for f in php8.2-worker.mjs.wasm php8.4-worker.mjs.wasm; do
+  echo "$f raw=$(stat -c%s $f) gz=$(gzip -9 -c $f | wc -c)"
+done
+# Session 9 final: 8.2 raw=15934663 gz=3977584 ; 8.4 raw=16462783 gz=4139775
+```
+
 ## Known fragile steps
 
 - **Exhaustive suspendable-imports list.** *Not a problem on this pipeline*

@@ -39,6 +39,9 @@ $r1 = fp_async_call('{"action":"query","sql":"SELECT value FROM config WHERE key
 $r2 = fp_async_call('{"action":"query","sql":"SELECT value FROM config WHERE key=?","params":["farewell"]}');
 echo "after: " . $r1 . " / " . $r2 . "\n";
 echo "php: " . PHP_VERSION . "\n";
+echo "ext: " . (extension_loaded('mysqli')?'mysqli ':'- ') . (extension_loaded('gd')?'gd ':'- ')
+    . (extension_loaded('curl')?'curl ':'- ') . (extension_loaded('mbstring')?'mb ':'- ')
+    . (extension_loaded('openssl')?'ssl ':'- ') . (extension_loaded('bcmath')?'bc':'-') . "\n";
 `;
 
 export default {
