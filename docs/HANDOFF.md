@@ -25,7 +25,19 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Session 9 PASS (2026-06-10). Binary size reduction via extension stripping
+**Phase:** Session 10 done (2026-06-10) — networking investigation, report-only
+(ADR-0020, `docs/RESEARCH-networking.md`). Key outcomes: the upstream companion
+extensions (`pdo_cfd1` for D1, `vrzno` for fetch/JS-bridge) use the **same Asyncify
+suspension mechanism** as `fp_async_call`; `pdo_cfd1` hard-depends on vrzno and has
+WordPress-breaking stubs (`lastInsertId()`→0, no `exec()`, no transactions, unescaped
+`quote()`); **all three companion repos are unlicensed** (GitHub `license: null`) —
+adoption blocked under ADR-0001/0003 until upstream licenses them. mysqli/curl are
+absent from the pipeline by design (DB = PDO drivers, HTTP = fetch). WP's Requests
+library needs a small WP-side transport shim under ANY architecture — and it can
+target `fp_async_call` today. **`fp_async_call` is not superseded** (ADR-0020); the
+(a)-vs-(b) architecture choice is deferred to a prototype-to-measure session.
+
+**Session 9 state (still true).** Binary size reduction via extension stripping
 (ADR-0019): `WITH_TIDY=0` (+libtidy.a out), `WITH_CALENDAR=0`, `WITH_PDO_PGLITE=0` on
 both versions. Final `gzip -9` sizes: **8.2 = 3,977,584 B (3.79 MiB)**, **8.4 =
 4,139,775 B (3.95 MiB)**; combined **7.74 MiB — the two-binary single-Worker deployment
@@ -118,6 +130,9 @@ unwind/rewind is stateless across calls. Node V8 regression: PASS (stub fallback
 - `docs/DECISIONS.md` — ADR-0017
 
 **What all sessions established (all true):**
+- Session 10: networking investigated (report-only). Companion exts use the same
+  Asyncify mechanism; pdo_cfd1 is vrzno-coupled + stub-ridden; all three unlicensed —
+  adoption blocked; fp_async_call stands (ADR-0020).
 - Session 9 PASS: tidy/calendar/pdo_pglite stripped; 8.2 = 3.79 MiB gz, 8.4 = 3.95 MiB gz,
   combined 7.74 MiB — fits the 10 MB Paid limit. Static/dynamic split documented; WP
   extension floor finding recorded; intl in-binary cost = 0 B.
@@ -191,6 +206,13 @@ Source deltas for Sessions 2–5 are committed as patches.
    binary — WP extension floor not met (named finding); intl in-binary cost 0 B
    (ADR-0019) — PASS (2026-06-10).
 
+10. **[DONE] Networking investigation (report-only).** pdo_cfd1/vrzno/pdo_pglite read
+    from source: same Asyncify mechanism as fp_async_call; pdo_cfd1 vrzno-coupled with
+    WP-breaking stubs; all three unlicensed (adoption blocked); mysqli/curl absent by
+    design; WP needs a Requests-transport shim under any architecture. fp_async_call
+    NOT superseded; (a)-vs-(b) deferred to prototype-to-measure (ADR-0020,
+    `docs/RESEARCH-networking.md`) — DONE (2026-06-10).
+
 **The PoC is complete.** The ADR-0005 success criterion is satisfied in workerd.
 ADR-0006 is fully satisfied. The Asyncify suspend/resume primitive is proven in
 both Node V8 and Cloudflare Workers / workerd, against real async host operations (KV and D1).
@@ -224,32 +246,32 @@ both Node V8 and Cloudflare Workers / workerd, against real async host operation
 
 ## Next action
 
-**Session 9 PASS.** Size reduced −6.2% gz per binary; **two-binary single-Worker
-deployment fits the 10 MB Paid limit (7.74 MiB combined, ~2.3 MiB headroom)** — the
-one-Worker-per-version split (option b) is NOT forced by size today. Per-binary
-Free-plan fit (3 MB) is out of reach without JSPI. intl remains a zero-cost lever
-only in the sense that it's already absent; the real future cost is *adding* it.
+**Session 10 done.** Networking architecture mapped (ADR-0020,
+`docs/RESEARCH-networking.md`). `fp_async_call` stands as the foundation; the
+DB-driver architecture choice ((a) all-through-fp_async_call vs (b) pdo_cfd1 for the
+DB hot path) is deferred pending data. Two zero/low-cost follow-ups identified:
+file upstream license-inquiry issues on vrzno/pdo-cfd1, and a prototype-to-measure
+build.
 
-**Potential next sessions (priority-ordered by the Session 9 findings):**
+**Potential next sessions (updated by Session 10):**
 
-1. **WordPress extension floor (static link).** The blocking gap for the WordPress
-   target: bring mbstring(+oniguruma), openssl, dom/xml/simplexml, sqlite3/pdo_sqlite,
-   zip, gd(+image libs), fileinfo into the static link (`WITH_X=static` where the
-   package supports it — libxml proved the pattern), and decide mysqli/curl
-   (`WITH_NETWORKING` or shim at the wp-db layer). Each addition grows the binary —
-   measure gz per extension and re-check the 10 MB combined budget; this may be what
-   finally forces JSPI or per-version Workers.
+1. **Prototype-to-measure: vrzno (+pdo_cfd1) throwaway build.** `WITH_VRZNO=1`
+   (+`WITH_PDO_CFD1=1`) on 8.4: gz size delta, workerd init (trampoline/GOT set),
+   empirical EM_ASYNC_JS + fp_async_call Asyncify coexistence, one PDO-driven D1
+   query. Output: the data ADR-0020 needs to settle (a) vs (b). Throwaway —
+   nothing merges without the license question resolving.
 
-2. **JSPI port (the big size lever).** Drops whole-program Asyncify instrumentation —
-   the dominant remaining mass after Session 9. Use `WebAssembly.Suspending`/
-   `WebAssembly.promising`; trampoline fix still applies (MAIN_MODULE=1 remains).
-   Re-examine suspendable-frame constraints (ADR-0008 caveat).
+2. **WordPress extension floor (static link).** Unchanged from Session 9: bring
+   mbstring(+oniguruma), openssl, dom/xml/simplexml, sqlite3/pdo_sqlite, zip,
+   gd(+image libs), fileinfo into the static link. mysqli is now settled — NOT
+   needed (DB goes through PDO/fp_async_call per ADR-0020); curl likewise (HTTP
+   goes through fetch + a WP Requests-transport shim).
 
-3. **WordPress bootstrap.** Boot a minimal WordPress against the D1 consumer —
-   blocked in practice on (1).
+3. **WP-side shims (architecture-invariant, can start anytime).** A Requests
+   transport on `fp_async_call` (`{action:"fetch",…}`) and a `db.php`-style DB
+   shim (Playground pattern, GPL-side). Both work regardless of the (a)/(b)
+   outcome.
 
-4. **R2 / Durable Objects consumers.** Additional `mod.hostAsyncCall` dispatch cases;
-   no rebuild needed.
+4. **JSPI port (the big size lever).** Unchanged from Session 9.
 
-5. **PHP patch-version bump.** Move `PHP_VERSION_FULL` pins with a dedicated
-   validation pass — a new ADR per ADR-0018.
+5. **R2 / Durable Objects consumers; PHP patch-version bump.** Unchanged.

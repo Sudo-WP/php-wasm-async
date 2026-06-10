@@ -10,6 +10,64 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0020 — Session 10: networking-architecture findings; fp_async_call stands; vrzno/pdo_cfd1 adoption blocked on licensing, deferred to a measured prototype
+**Date:** 2026-06-10 · **Status:** Accepted (findings final; the (a)-vs-(b) architecture choice is **decision-pending** a measured prototype)
+
+**Context.** Session 9 found the WordPress extension floor unmet and mysqli/curl absent
+from the pipeline. Session 10 investigated (report-only — `docs/RESEARCH-networking.md`)
+how the upstream ecosystem intends DB/HTTP to work on Workers: the companion extensions
+`pdo_cfd1` (D1 PDO driver), `vrzno` (JS bridge + fetch), `pdo_pglite`.
+
+**Findings (recorded as binding facts, with source citations in the research doc).**
+1. `pdo_cfd1` and `vrzno` suspend PHP via `EM_ASYNC_JS` — the **same Asyncify
+   mechanism** as `fp_async_call`. No second mechanism; no suspension-ownership
+   conflict; coexistence in one binary is expected safe (empirical verification
+   pending).
+2. `pdo_cfd1` hard-depends on vrzno (header include + zval↔JS proxy runtime); it is
+   not standalone despite the repo split.
+3. `pdo_cfd1` implements only prepare→execute→fetch. `PDO::exec()`, transactions,
+   `lastInsertId()` (returns 0), `quote()` (no escaping), attributes, and error
+   propagation are stubs — several are WordPress-breakers (`$wpdb->insert_id`).
+4. **vrzno, pdo-cfd1, and pdo-pglite carry no license** (no LICENSE file; GitHub
+   `license: null`). All-rights-reserved by default. The Apache-2.0 pipeline clones
+   them from unpinned `master` at build time; its license does not cover them. Under
+   ADR-0001/0003 we can neither ship nor fork them until upstream licenses them.
+5. mysqli/curl are absent **by design**: `WITH_NETWORKING=1` only links Emscripten's
+   WebSocket socket emulation. Intended architecture: DB via PDO companion drivers,
+   HTTP via JS `fetch()`.
+6. WordPress HTTP is not free under either candidate: WP's Requests library ships only
+   cURL and fsockopen transports. A small WP-side transport shim is required
+   regardless, and it can target `fp_async_call` today (no rebuild).
+7. No WordPress integration exists anywhere in this ecosystem. The Playground
+   `db.php`/SQLite-translation pattern (GPL) transfers conceptually to D1 and lives on
+   the WordPress (GPL) side of the ADR-0003 boundary — it does not contaminate this
+   repo regardless of what it targets.
+
+**Decision.**
+- **`fp_async_call` is NOT superseded.** It remains the project's async foundation
+  (ADR-0016 invariant unchanged): proven in workerd, Apache-2.0-clean, already
+  demonstrated against D1/KV, and sufficient to back both the DB and HTTP shims
+  WordPress needs.
+- **vrzno/pdo_cfd1 are not adopted in this decision.** Adoption is blocked on
+  licensing (finding 4) and on the stub gaps (finding 3); the architecture choice
+  between (a) everything-through-`fp_async_call` (incl. possibly our own thin PDO
+  driver) and (b) pdo_cfd1-for-DB + `fp_async_call`-for-the-rest is **deferred to a
+  prototype-to-measure session**: throwaway 8.4 build with `WITH_VRZNO=1`
+  (+`WITH_PDO_CFD1=1`), measuring gz size delta, workerd init compatibility
+  (trampoline/GOT), empirical Asyncify coexistence, and a PDO-driven D1 query.
+- **Option (c) (adopt wholesale, retire `fp_async_call`) is rejected** — it maximizes
+  unlicensed surface and discards the one licensed, proven primitive.
+- File upstream license-inquiry issues on vrzno/pdo-cfd1 (zero cost; unblocks (b)).
+
+**Consequences.** `WITH_VRZNO=0` stays in our env files (Session 8 decision
+reaffirmed — now grounded: enabling it adds unlicensed code and unmeasured size, not
+just an unused extension). Next-session candidates reordered in HANDOFF: the
+prototype-to-measure session and the WP-side shims (which are architecture-invariant)
+can proceed in either order; the WP extension floor session (Session 9 finding)
+remains on the list independently.
+
+---
+
 ## ADR-0019 — Session 9: binary size reduction by extension stripping; the static/dynamic split finding; gzip as the governing metric
 **Date:** 2026-06-10 · **Status:** Accepted
 
