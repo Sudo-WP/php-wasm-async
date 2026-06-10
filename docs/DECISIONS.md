@@ -10,6 +10,86 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0019 — Session 9: binary size reduction by extension stripping; the static/dynamic split finding; gzip as the governing metric
+**Date:** 2026-06-10 · **Status:** Accepted
+
+**Goal.** Shrink each worker wasm for Cloudflare's Worker size limit, which is measured
+in **compressed (gzipped) bytes**: 3 MB Free plan, 10 MB Paid plan. Session 8 baseline,
+`gzip -9`: 8.2 = 4,250,384 B; 8.4 = 4,414,500 B; combined ≈ 8.27 MiB — under the Paid
+limit but uncomfortably close. Gzipped size is the governing metric; raw size is recorded
+as secondary (cold-start instantiation time).
+
+**Pre-decision finding that reframes the session (the static/dynamic split).**
+The pipeline is **dynamic-by-default**: for most packages, `WITH_X=1` means
+`WITH_X=dynamic` — the extension is built as a WASM **side module** (`.so`), exactly as
+ADR-0011 found for iconv. The main worker binary statically contains only:
+
+- PHP core (Core, date, pcre, json, hash, SPL, standard, random, Reflection) plus the
+  `--enable-*` static set: **bcmath, calendar, ctype, exif, filter, session, tokenizer,
+  pdo, pdo_pglite, pib**, and **libxml + tidy** (the only two `=static` flags), and
+- exactly two non-PHP archives in the final link: `libxml2.a` and `libtidy.a`
+  (confirmed from the Session 8 link command).
+
+Everything else flagged `=1` (mbstring, openssl, gd, dom, xml, simplexml, intl, sqlite,
+zip, zlib, yaml, phar, …) ships as side modules — which workerd **cannot load** (runtime
+wasm compilation is blocked, ADR-0015; no side module is bundled or loaded by the
+Worker). Two consequences:
+
+1. **The WordPress MUST-KEEP extension floor is not met by the current binaries and
+   never was.** mysqli/curl don't exist in this pipeline at all (`WITH_NETWORKING=0`);
+   mbstring, openssl, gd, dom, sqlite, zip, fileinfo are side modules invisible to
+   workerd. This is a named finding, not a Session 9 regression. Bringing the WP floor
+   into the static link is a **separate future session** and will *grow* the binary —
+   the sizes achieved here are the floor of the *current* capability set.
+2. **intl is already absent from the worker binary.** Its measured in-binary cost is
+   **0 bytes** (evidence: `get_loaded_extensions()` lacks intl; the final link contains
+   no ICU archive; `SKIP_LIBS` excludes `-licu*`). The conditional Phase 3
+   strip-or-keep decision is moot; no throwaway build is needed — per the ADR-0011
+   precedent, side-module flags do not change the main binary. `WITH_INTL=1` is left
+   as-is (it only affects unused side-module artifacts).
+
+**Decision — what is stripped from the static set (8.4 first, then replicated to 8.2):**
+
+| Flag change | Drops | Why safe for WordPress |
+|---|---|---|
+| `WITH_CALENDAR=0` | ext/calendar | Julian/Jewish/French-Revolutionary calendar conversions; WP does not use it |
+| `WITH_PDO_PGLITE=0` | ext/pdo_pglite | Postgres-in-wasm PDO driver (pipeline default `=1` crept back in Session 8; the 8.0 env had it 0). D1 path does not use it |
+| `WITH_TIDY=0` | ext/tidy + `libtidy.a` | WP does not use tidy. Session 5 chose `static` only because `WITH_TIDY=1`(=dynamic) conflicted with `WITH_LIBXML=static`; tidy's `static.mak` imposes **no constraint at `WITH_TIDY=0`** — verified. Also simplifies NOTICE (libtidy attribution no longer load-bearing) |
+
+**What is kept, deliberately:**
+- `WITH_LIBXML=static` — required to avoid the GOT/addFunction init blocker
+  (ADR-0014/0015). ext/libxml + libxml2.a stay.
+- bcmath, ctype, exif, filter, session, tokenizer, pdo — all on the WP required/
+  recommended floor (or its dependencies) and individually small.
+- All `=1` side-module flags — they cost the worker binary nothing; setting them to 0
+  would only skip building unused `.so` artifacts while adding diff noise against
+  upstream env files.
+
+**Method.** Phased and measured per the working protocol: Phase 1 (calendar + pglite),
+Phase 2 (tidy), each with rebuild → `gzip -9` measurement → Node V8 regression +
+suspend/resume → workerd D1 two-query smoke; Phase 4 replicates the final validated set
+to 8.2 and re-verifies the multi-version Worker. An extension sanity line is added to
+the demo PHP (`extension_loaded()` checks over the WP MUST-KEEP list) — expected to show
+most MUST-KEEP entries absent (consequence 1), with bcmath present.
+
+**Size expectation, stated honestly in advance.** The strippable static surface is
+small (tidy + calendar + pglite). The bulk of the binary is PHP core ×
+whole-program-Asyncify instrumentation (ADR-0008) + libxml2. The ≤3.5 MB-gzipped
+per-binary target is likely unreachable by stripping alone; if so, the result to record
+is the floor and its composition — the levers that remain are JSPI (drops Asyncify
+instrumentation, HANDOFF option) and one-Worker-per-version deployment.
+
+**Alternatives considered.**
+- Strip intl preemptively: moot — not in the binary (see finding above).
+- `OPTIMIZE=z` / link-flag tuning: out of scope by session definition (extension
+  stripping only); a future size session may try it.
+- Stripping session/exif/filter to chase the target: rejected — WP floor violation for
+  marginal bytes.
+- Setting all side-module flags to 0 for "cleanliness": rejected — zero effect on the
+  deliverable binary, large diff against upstream env files.
+
+---
+
 ## ADR-0018 — Session 8: dual PHP 8.2 + 8.4 build; multi-version Worker loader with header-based selection
 **Date:** 2026-06-10 · **Status:** Accepted · **Supersedes:** ADR-0004's PHP 8.0.30 baseline (the 8.0.30 *historical* results stand; 8.0.30 is no longer the build target)
 
