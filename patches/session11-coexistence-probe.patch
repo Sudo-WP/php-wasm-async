@@ -1,0 +1,49 @@
+--- a/source/pib/pib.c
++++ b/source/pib/pib.c
+@@ -323,8 +323,46 @@
+ 	}
+ }
+ 
++/*
++ * THROWAWAY — Session 11 coexistence probe. Remove after ADR-0021.
++ * Second Asyncify-suspending import, deliberately packaged the OTHER standard
++ * way (EM_ASYNC_JS, the pattern the future clean-room D1 PDO driver will use)
++ * to prove mixed-packaging coexistence with the JS-library fp_async_call.
++ * Resolves on a setTimeout(0) macrotask so the Promise is genuinely
++ * unresolved at suspend time (Session 3 rigor).
++ */
++EM_ASYNC_JS(char*, fp_async_probe_js, (const char* payload), {
++	const input = UTF8ToString(payload);
++	const result = await new Promise(r => setTimeout(() => r("probe:" + input), 0));
++	return stringToNewUTF8(result);
++});
++
++/* THROWAWAY — Session 11 coexistence probe. Remove after ADR-0021. */
++ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_fp_async_probe, 0, 1, IS_STRING, 0)
++	ZEND_ARG_TYPE_INFO(0, payload, IS_STRING, 0)
++ZEND_END_ARG_INFO()
++
++PHP_FUNCTION(fp_async_probe)
++{
++	char *payload;
++	size_t payload_len;
++
++	ZEND_PARSE_PARAMETERS_START(1, 1)
++		Z_PARAM_STRING(payload, payload_len)
++	ZEND_PARSE_PARAMETERS_END();
++
++	char *result = fp_async_probe_js(payload);
++	if (result != NULL) {
++		RETVAL_STRING(result);
++		free(result);
++	} else {
++		RETURN_EMPTY_STRING();
++	}
++}
++
+ static const zend_function_entry pib_functions[] = {
+ 	PHP_FE(fp_async_call, arginfo_fp_async_call)
++	PHP_FE(fp_async_probe, arginfo_fp_async_probe)  /* THROWAWAY — Session 11 */
+ 	PHP_FE_END
+ };
+ 

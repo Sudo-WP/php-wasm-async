@@ -41,7 +41,30 @@ PHP run, two consecutive requests. The probe is captured as
 `patches/session11-coexistence-probe.patch` (our Apache-2.0 code, documents the proof)
 and then reverted — it does not ship.
 
-**Result.** *(appended after measurement — see below and RESULTS Session 11)*
+**Result (2026-06-11): PASS — coexistence confirmed.**
+- **workerd, interleaved:** one PHP execution performed four suspensions alternating
+  between the two packagings — JS-library D1 query → EM_ASYNC_JS probe → JS-library
+  D1 query → EM_ASYNC_JS probe — all values correct
+  (`hello from D1`, `probe:alpha`, `goodbye from D1`, `probe:beta`), identical on two
+  consecutive requests. No state corruption, no hangs, no stack errors.
+- **Node V8:** regression + Session 3 suspend/resume unchanged PASS; the same
+  interleaved script PASS.
+- **EM_ASYNC_JS compiles cleanly** under the sm-updates 3.1.68 fork (no special
+  handling; `emscripten.h` already included in pib.c; `stringToNewUTF8` available).
+- **Trampoline/GOT (open risk #3):** workerd init clean; zero
+  `convertJsFunctionToWasm`/code-generation errors — no GOT.func signature beyond
+  `vp` appeared; the single bundled trampoline still suffices.
+- **Size:** probe build vs Session 9 final 8.4: raw +2,333 B, gz −7 B (noise). The
+  fixed overhead of "one more EM_ASYNC_JS import" is negligible; the future driver's
+  cost will be its own logic, not the import mechanism.
+
+**What this clears.** The clean-room D1 PDO driver can be written as a second
+suspending extension using `EM_ASYNC_JS` beside `pib`/`fp_async_call` with no
+architectural risk identified. The probe is recorded as
+`patches/session11-coexistence-probe.patch` and reverted from the tree — it does not
+ship. First task for the driver session: confirm from Cloudflare's D1 docs that
+`meta.last_row_id`/`meta.changes` suffice for `lastInsertId()`/affected-rows
+(RESEARCH-networking open question #4).
 
 ---
 

@@ -25,7 +25,16 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Session 10 done (2026-06-10) — networking investigation, report-only
+**Phase:** Session 11 PASS (2026-06-11) — Asyncify mixed-packaging coexistence proven
+(ADR-0021). A throwaway `EM_ASYNC_JS` suspender (`fp_async_probe`) ran interleaved
+with the JS-library `fp_async_call` in one PHP execution in workerd: four suspensions,
+two mechanisms, alternating, correct values, two consecutive requests. No trampoline/
+GOT changes (still only `vp`); size delta noise (+2,333 B raw / −7 B gz). The
+architecture decision is made: **option (a) — clean-room Apache-2.0 D1 PDO driver on
+our own primitive**; vrzno/pdo_cfd1 are out entirely. Probe captured as
+`patches/session11-coexistence-probe.patch` and reverted — canonical source is clean.
+
+**Session 10 state (still true)** — networking investigation, report-only
 (ADR-0020, `docs/RESEARCH-networking.md`). Key outcomes: the upstream companion
 extensions (`pdo_cfd1` for D1, `vrzno` for fetch/JS-bridge) use the **same Asyncify
 suspension mechanism** as `fp_async_call`; `pdo_cfd1` hard-depends on vrzno and has
@@ -130,6 +139,9 @@ unwind/rewind is stateless across calls. Node V8 regression: PASS (stub fallback
 - `docs/DECISIONS.md` — ADR-0017
 
 **What all sessions established (all true):**
+- Session 11 PASS: EM_ASYNC_JS + JS-library Asyncify imports coexist in one binary in
+  workerd, interleaved (4 suspensions/run). Clears the clean-room D1 PDO driver
+  (ADR-0021, option a). GOT still `vp`-only; EM_ASYNC_JS overhead negligible.
 - Session 10: networking investigated (report-only). Companion exts use the same
   Asyncify mechanism; pdo_cfd1 is vrzno-coupled + stub-ridden; all three unlicensed —
   adoption blocked; fp_async_call stands (ADR-0020).
@@ -206,6 +218,12 @@ Source deltas for Sessions 2–5 are committed as patches.
    binary — WP extension floor not met (named finding); intl in-binary cost 0 B
    (ADR-0019) — PASS (2026-06-10).
 
+11. **[DONE] Asyncify coexistence proof.** Throwaway EM_ASYNC_JS probe beside
+    fp_async_call: interleaved 4-suspension run PASS in workerd ×2 requests; Node
+    PASS; GOT unchanged (`vp` only); size delta noise. Probe recorded as
+    `patches/session11-coexistence-probe.patch`, then reverted (ADR-0021) —
+    PASS (2026-06-11).
+
 10. **[DONE] Networking investigation (report-only).** pdo_cfd1/vrzno/pdo_pglite read
     from source: same Asyncify mechanism as fp_async_call; pdo_cfd1 vrzno-coupled with
     WP-breaking stubs; all three unlicensed (adoption blocked); mysqli/curl absent by
@@ -246,32 +264,23 @@ both Node V8 and Cloudflare Workers / workerd, against real async host operation
 
 ## Next action
 
-**Session 10 done.** Networking architecture mapped (ADR-0020,
-`docs/RESEARCH-networking.md`). `fp_async_call` stands as the foundation; the
-DB-driver architecture choice ((a) all-through-fp_async_call vs (b) pdo_cfd1 for the
-DB hot path) is deferred pending data. Two zero/low-cost follow-ups identified:
-file upstream license-inquiry issues on vrzno/pdo-cfd1, and a prototype-to-measure
-build.
+**Session 11 PASS.** Coexistence proven; the path to the clean-room D1 PDO driver is
+clear (ADR-0021, option a). The ADR-0020 vrzno prototype is superseded and will not
+run; the upstream license inquiry is moot for our path.
 
-**Potential next sessions (updated by Session 10):**
+**Next session: clean-room D1 PDO driver (the main event).**
+- FIRST: confirm from Cloudflare D1 docs that `meta.last_row_id` / `meta.changes`
+  from `stmt.run()` suffice for `lastInsertId()` and affected-rows (carried-forward
+  open question #4 from RESEARCH-networking).
+- New static extension (e.g. `ext/pdo_d1`, ours, Apache-2.0) beside pib: PDO driver
+  surface (prepare/execute/fetch + exec + lastInsertId + affected-rows + quote with
+  real escaping + error propagation — the pdo_cfd1 stub list is the requirements
+  list), suspending via EM_ASYNC_JS (proven Session 11), D1 binding injected as a
+  Module property by the Worker (same loader pattern as `Module.hostAsyncCall`).
+- PDO driver API knowledge comes from PHP's own headers/docs (`pdo_dbh_t` /
+  `pdo_stmt_t` method tables — PHP License, fine); pdo_cfd1 was read for facts only
+  (ADR-0003 discipline).
 
-1. **Prototype-to-measure: vrzno (+pdo_cfd1) throwaway build.** `WITH_VRZNO=1`
-   (+`WITH_PDO_CFD1=1`) on 8.4: gz size delta, workerd init (trampoline/GOT set),
-   empirical EM_ASYNC_JS + fp_async_call Asyncify coexistence, one PDO-driven D1
-   query. Output: the data ADR-0020 needs to settle (a) vs (b). Throwaway —
-   nothing merges without the license question resolving.
-
-2. **WordPress extension floor (static link).** Unchanged from Session 9: bring
-   mbstring(+oniguruma), openssl, dom/xml/simplexml, sqlite3/pdo_sqlite, zip,
-   gd(+image libs), fileinfo into the static link. mysqli is now settled — NOT
-   needed (DB goes through PDO/fp_async_call per ADR-0020); curl likewise (HTTP
-   goes through fetch + a WP Requests-transport shim).
-
-3. **WP-side shims (architecture-invariant, can start anytime).** A Requests
-   transport on `fp_async_call` (`{action:"fetch",…}`) and a `db.php`-style DB
-   shim (Playground pattern, GPL-side). Both work regardless of the (a)/(b)
-   outcome.
-
-4. **JSPI port (the big size lever).** Unchanged from Session 9.
-
-5. **R2 / Durable Objects consumers; PHP patch-version bump.** Unchanged.
+**After that (unchanged):** WordPress extension floor (static link); WP-side shims
+(Requests transport + db.php-style DB shim — can start anytime); JSPI port; R2/DO
+consumers; PHP patch-version bump.

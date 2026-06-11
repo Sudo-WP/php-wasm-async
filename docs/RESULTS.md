@@ -880,6 +880,75 @@ single-deployment selection).
 
 ---
 
+## Session 11 — Asyncify mixed-packaging coexistence: PASS (2026-06-11)
+
+**PASS.** A second Asyncify-suspending extension function packaged as `EM_ASYNC_JS`
+(`fp_async_probe`) coexists with the JS-library-packaged `fp_async_call` in one
+binary, in workerd — both suspending and resuming correctly, interleaved, within a
+single PHP execution. This was the one assumption gating the clean-room D1 PDO
+driver (ADR-0021); it is now measured, not predicted.
+
+### The probe
+
+~40 lines added to `pib.c` (THROWAWAY-marked, captured as
+`patches/session11-coexistence-probe.patch`, then reverted): `fp_async_probe(string):
+string` via `EM_ASYNC_JS`, resolving on a `setTimeout(0)` macrotask (genuinely
+unresolved at suspend time — Session 3 rigor). Same string ABI and free() pattern as
+Session 6. Built on 8.4 only, Session 9 flag set, standard glue patches + trampoline.
+`EM_ASYNC_JS` compiled cleanly under the sm-updates 3.1.68 fork with no special
+handling.
+
+### workerd interleaved test (the deliverable)
+
+Four suspensions, two mechanisms, alternating, one PHP run — strictly stronger than
+what the PDO driver needs. Two consecutive requests, identical output:
+
+```
+start
+1 fp_async_call: {"value":"hello from D1"}     ← JS-library suspend (real D1 query)
+2 fp_async_probe: probe:alpha                  ← EM_ASYNC_JS suspend
+3 fp_async_call: {"value":"goodbye from D1"}   ← JS-library suspend (real D1 query)
+4 fp_async_probe: probe:beta                   ← EM_ASYNC_JS suspend
+done
+```
+
+No state corruption, no hangs, no stack errors, in either JS-lib→EM_ASYNC_JS or
+EM_ASYNC_JS→JS-lib transitions.
+
+### Node V8
+
+- `test-regression.mjs` (8.4.1) — PASS; `test-session3.mjs` — PASS (fp_async_call
+  path untouched).
+- `test-session11.mjs` (same interleaving against the stub handler) — PASS:
+  `start / 1 call: 42 / 2 probe: probe:alpha / 3 call: 100 / 4 probe: probe:beta / done`.
+
+### Trampoline / GOT check (open risk #3)
+
+workerd init clean. Zero `convertJsFunctionToWasm` / "Wasm code generation" /
+`Table.set` errors in the wrangler log — no GOT.func signature beyond `vp` appeared.
+The single bundled `trampoline-vp.wasm` still suffices. EM_ASYNC_JS imports are wired
+as ordinary (async) JS imports, not via the GOT/addFunction path.
+
+### Size (8.4 worker, gzip -9)
+
+| | raw | gz |
+|---|---|---|
+| Session 9 final | 16,462,783 | 4,139,775 |
+| + probe (1 EM_ASYNC_JS import + PHP wrapper) | 16,465,116 | 4,139,768 |
+| delta | **+2,333** | **−7 (noise)** |
+
+The fixed overhead of an additional EM_ASYNC_JS import is negligible; the future
+driver's size cost will be its own logic.
+
+### Aftermath
+
+Probe reverted from the scratch tree (canonical source clean); the patch file is the
+record. The deployed `worker/build` artifacts were rebuilt probe-free. Next session:
+the clean-room D1 PDO driver (ADR-0021), starting with D1 `meta.last_row_id`/`changes`
+sufficiency for `lastInsertId()`/affected-rows.
+
+---
+
 ## Asyncify vs JSPI comparison
 
 *Pending Session 5.* To be recorded:
