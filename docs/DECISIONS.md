@@ -10,6 +10,53 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0023 — Session 13: the WordPress extension floor — static-link plan, batches, and the size-tripwire protocol
+**Date:** 2026-06-11 · **Status:** Accepted · **Builds on:** ADR-0019 (static/dynamic split), ADR-0022 (pdo_d1 removes mysqli + sqlite from the floor)
+
+**Decision.** Statically link the WordPress MUST-KEEP extension floor into the worker
+binaries, in measured batches, 8.4 first, replicated to 8.2 at the end:
+
+| Batch | Extensions | Libs | Flags |
+|---|---|---|---|
+| 1 | mbstring | oniguruma | `WITH_MBSTRING=static`, `WITH_ONIGURUMA=static` |
+| 2 | dom, simplexml, xml, xmlreader, xmlwriter | libxml2 (already static, S5) | `WITH_X=static` ×5 |
+| 3 | openssl | libssl/libcrypto 1.1.1x | `WITH_OPENSSL=static` (NOTE: upstream switches the build to ThinLTO — `-flto=thin` — for static OpenSSL; recorded as a deliberate global link-flag change) |
+| 4 | zip, zlib | libzip, zlib | `WITH_LIBZIP=static`, `WITH_ZLIB=static` |
+| 5 | fileinfo | (bundled libmagic data — measured separately) | `CONFIGURE_FLAGS+= --enable-fileinfo` via the env file (no pipeline package exists; this is the minimal, non-structural addition) |
+| 6 | gd | libpng, libjpeg, libwebp, freetype | `WITH_GD/LIBPNG/LIBJPEG/WEBP/FREETYPE=static` — last, droppable to a follow-up if budget dies |
+
+Pipeline survey (pre-decision): every floor package already has a `static` mode in
+its `static.mak` (the Session 5 libxml pattern is uniform); no `$(error)` couplings
+exist within the floor set; `ARCHIVES` are prerequisites of `configured`, so the
+static libs build automatically. fileinfo is the only extension with no package.
+
+**Out of scope (standing decisions):** intl/ICU (ADR-0019), mysqli + sqlite3/
+pdo_sqlite (replaced by pdo_d1, ADR-0022), curl (HTTP via fetch + fp_async_call,
+ADR-0020), tidy/calendar/pdo_pglite/soap/ftp/etc (Session 9; most never existed).
+exif is already static since Session 1's `--enable` set.
+
+**Per-batch gates:** rebuild worker-mjs → raw+gz size into the running table → Node
+regression + pdo_d1 mock stay green → workerd smoke (D1-via-PDO + fp_async_call
+interleave + extension sanity line extended each batch) → GOT/trampoline check (a
+new signature beyond `vp` STOPS the batch and is reported as a symbol+signature
+list; an additional trampoline is a known scoped fix but a decision, not a silent
+workaround). Functional probes per family (loaded ≠ functional): mb_strlen
+(multibyte), DOMDocument parse, openssl_random_pseudo_bytes, ZipArchive,
+finfo buffer, imagecreatetruecolor.
+
+**Size-tripwire protocol (binding for this session).** Budget: 10 MiB gz combined
+(Paid plan), currently 7.75 MiB → ~1.1 MiB gz headroom per binary. The floor may not
+fit — that is an expected RESULT. When the combined bundle crosses 10 MiB gz, the
+crossing batch is noted and the session CONTINUES to finish the floor (the data
+matters more than the limit). The fit-strategy decision — (i) per-version Workers,
+(ii) JSPI port, (iii) trim the floor — is the NEXT session's ADR, made on this
+session's measured numbers, not mid-session.
+
+**Fallback:** a batch that fails to build statically after reasonable effort is
+DEFERRED with its exact error; the session proceeds to the next batch.
+
+---
+
 ## ADR-0022 — Session 12: pdo_d1 architecture — clean-room D1 PDO driver, Phase 1
 **Date:** 2026-06-11 · **Status:** Accepted · **Builds on:** ADR-0021 (coexistence proven), Session 11.5 (D1 meta measured)
 
