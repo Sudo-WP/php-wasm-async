@@ -10,6 +10,41 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0021 — Session 11: option (a) chosen — clean-room D1 PDO driver on our primitive; coexistence proven with our own probe instead of a vrzno prototype
+**Date:** 2026-06-11 · **Status:** Accepted · **Resolves:** ADR-0020's deferred (a)-vs-(b) choice
+
+**Decision (made before this session's build work, recorded first per protocol).**
+The DB architecture is **option (a)**: a clean-room, Apache-2.0 **D1 PDO driver of our
+own**, built as a second suspending extension beside `pib`/`fp_async_call`. The
+unlicensed vrzno/pdo_cfd1 extensions are out entirely — not built, not measured, not
+adopted. This supersedes ADR-0020's plan to prototype `WITH_VRZNO=1 + WITH_PDO_CFD1=1`
+for measurement: that prototype would have compiled unlicensed code to answer a
+question we can answer with ~20 lines of our own. The licensing inquiry to upstream
+becomes moot for our path (the ADR-0020 findings about those extensions remain valid
+as findings).
+
+**The one assumption to verify before writing the driver.** Can a second
+Asyncify-suspending extension function — packaged the `EM_ASYNC_JS` way, which is how
+the driver will likely be written — coexist with the JS-library-packaged
+`fp_async_call` in one binary in workerd, with both suspending and resuming correctly,
+interleaved, in a single PHP execution? RESEARCH-networking §1 predicts yes
+(Asyncify is a runtime facility; whole-program instrumentation per ADR-0008; PHP
+single-threaded; Session 7 proved sequential suspensions stateless). Predicted-yes is
+not measured-yes when ~700 lines of C depend on the answer.
+
+**Method.** Throwaway probe in `pib.c` (8.4 only, Session 9 flag set):
+`fp_async_probe(string): string` implemented as `EM_ASYNC_JS` resolving on a
+`setTimeout(0)` macrotask (Session 3 rigor — genuinely unresolved at suspend time).
+workerd test interleaves the two mechanisms: JS-lib suspend (D1 query) →
+EM_ASYNC_JS suspend → JS-lib suspend → EM_ASYNC_JS suspend, four suspensions in one
+PHP run, two consecutive requests. The probe is captured as
+`patches/session11-coexistence-probe.patch` (our Apache-2.0 code, documents the proof)
+and then reverted — it does not ship.
+
+**Result.** *(appended after measurement — see below and RESULTS Session 11)*
+
+---
+
 ## ADR-0020 — Session 10: networking-architecture findings; fp_async_call stands; vrzno/pdo_cfd1 adoption blocked on licensing, deferred to a measured prototype
 **Date:** 2026-06-10 · **Status:** Accepted (findings final; the (a)-vs-(b) architecture choice is **decision-pending** a measured prototype)
 
