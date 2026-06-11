@@ -25,7 +25,17 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Session 12 PASS (2026-06-11) — **pdo_d1 Phase 1 shipped** (ADR-0022). The
+**Phase:** Session 13 PASS (2026-06-11) — **the WordPress extension floor is complete
+on both versions** (ADR-0023): mbstring, dom/simplexml/xml/xmlreader/xmlwriter,
+openssl, zip/zlib, fileinfo, gd (+exif/bcmath from before) all statically linked and
+**functionally probed** in workerd on 8.4.1 and 8.2.11. GOT stayed `vp`-only through
+all six batches. Pipeline finding: upstream's mbstring static mode was broken for
+PHP 8.x (`--with-mbstring`/`--with-onig` silently ignored) — fixed in the session
+patch. **Size: 8.4 = 8.51 MiB gz (38.5 MiB raw!), 8.2 = 7.38 MiB gz; combined
+15.89 MiB gz — 66% over the 10 MiB Paid limit** (crossed at batch 2, per the ADR-0023
+tripwire). Per-batch cost table in RESULTS. The fit-strategy decision is NEXT.
+
+**Session 12 state (still true).** Session 12 PASS (2026-06-11) — **pdo_d1 Phase 1 shipped** (ADR-0022). The
 clean-room Apache-2.0 D1 PDO driver builds and passes all gates on 8.4.1 AND 8.2.11:
 prepare/bind/execute/fetch*, real exec() (meta.changes), real lastInsertId()
 (meta.last_row_id), real rowCount(), PDOException with the D1 error text, safe
@@ -151,6 +161,10 @@ unwind/rewind is stateless across calls. Node V8 regression: PASS (stub fallback
 - `docs/DECISIONS.md` — ADR-0017
 
 **What all sessions established (all true):**
+- Session 13 PASS: full WP extension floor static on both versions, functionally
+  probed; floor costs +4.56 MiB gz (8.4); combined bundle 15.89 MiB gz — over the
+  Paid limit; per-version Workers fit today (8.51 / 7.38 MiB each); JSPI is the
+  structural lever; trimming alone cannot fit (ADR-0023, RESULTS S13).
 - Session 12 PASS: pdo_d1 Phase 1 — clean-room Apache-2.0 D1 PDO driver, all surfaces
   real (the pdo_cfd1 stub list), both PHP versions, ~16 KB raw cost. `new PDO('d1:main')`
   works in workerd against miniflare D1, interleaved with fp_async_call (ADR-0022).
@@ -279,25 +293,26 @@ both Node V8 and Cloudflare Workers / workerd, against real async host operation
 
 ## Next action
 
-**Session 12 PASS.** pdo_d1 Phase 1 shipped on both versions. The DB hot path for the
-WordPress target now exists end-to-end: `new PDO('d1:main')` → EM_ASYNC_JS → D1.
+**Session 13 PASS — and the fit-strategy decision is now forced.** The floor is
+complete and functional, but the combined bundle (15.89 MiB gz) exceeds the 10 MiB
+Paid limit. **Next session's FIRST step is ADR-0024: choose the fit strategy** on the
+measured numbers (RESULTS Session 13):
 
-**Potential next sessions:**
+- **(i) Per-version Workers — fits today** (8.4 = 8.51 MiB gz, 8.2 = 7.38 MiB gz,
+  each under 10 MiB with headroom). Cheapest path to deployable; loses
+  single-deployment header selection (router Worker or DNS/route split instead).
+- **(ii) JSPI port — the structural lever.** Asyncify instrumentation multiplies
+  every extension's code cost (see batch 2); JSPI removes it and helps the
+  38.5 MiB-raw cold-start concern too. Worth measuring soon regardless of (i).
+- **(iii) Trim — only as a complement**; cannot reach 10 MiB combined alone.
 
-1. **pdo_d1 Phase 2.** Transactions strategy (batch-based emulation vs documented
-   no-transaction mode + WP-side handling — D1's `.batch()` per-entry meta is already
-   measured, Session 11.5); `getAttribute`/`setAttribute` minimum; production-D1
-   re-verification of the meta semantics (4-item list in RESULTS, needs a deployed
-   Worker).
+A pragmatic sequencing: adopt (i) now (unblocks everything downstream), schedule (ii)
+as the optimization session, keep (iii) in reserve.
 
-2. **WP-side shims.** The `db.php` drop-in targeting pdo_d1 (Playground
-   wp-sqlite-db pattern, MySQL→SQLite translation, GPL-side) and the Requests
-   transport on `fp_async_call` (`{action:"fetch",…}`). The runtime surfaces they
-   need are now both in place.
-
-3. **WordPress extension floor (static link).** Unchanged from Session 9; pdo_d1
-   removes sqlite3/pdo_sqlite and mysqli from the must-add list (DB goes through
-   pdo_d1), shrinking the floor to: mbstring(+oniguruma), openssl, dom/xml/simplexml,
-   zip, gd(+image libs), fileinfo.
-
-4. **JSPI port; R2/DO consumers; PHP patch-version bump.** Unchanged.
+**Then (unchanged order):**
+1. **WP-side shims** — db.php drop-in targeting pdo_d1 + Requests transport on
+   fp_async_call. All runtime surfaces now exist (pdo_d1 + the full extension floor).
+2. **pdo_d1 Phase 2** — transactions strategy, attributes, production-D1 meta
+   re-verification.
+3. **WordPress bootstrap** — now genuinely unblocked: DB path + extension floor done.
+4. R2/DO consumers; PHP patch-version bump.

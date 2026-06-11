@@ -751,6 +751,46 @@ must call `pdo_parse_params` in its preparer to get `:name` → `?` rewriting an
 `bound_param_map` (the pdo_mysql/pdo_pgsql pattern). Without it, named params reach
 the driver unresolved (`paramno == -1`).
 
+### Session 13 — WordPress extension floor (validated 2026-06-11)
+
+**Goal:** statically link the WP MUST-KEEP floor (ADR-0023). Final flag set, both
+`.env_8.2.ci` and `.env_8.4.ci` (committed as `patches/session13-extension-floor.patch`):
+
+```
+WITH_MBSTRING=static  WITH_ONIGURUMA=static
+WITH_DOM=static  WITH_XML=static  WITH_SIMPLEXML=static
+WITH_XMLREADER=static  WITH_XMLWRITER=static          # added; not in upstream env
+WITH_OPENSSL=static                                    # switches build to ThinLTO (upstream .mak)
+WITH_LIBZIP=static  WITH_ZLIB=static
+WITH_GD=static  WITH_LIBPNG=static  WITH_LIBJPEG=static
+WITH_FREETYPE=static  WITH_LIBWEBP=static              # WEBP added; not in upstream env
+CONFIGURE_FLAGS+= --enable-fileinfo                    # no pipeline package exists
+```
+
+**.mak fixes required (in the same patch):**
+- `packages/mbstring/static.mak`: `--with-mbstring` → `--enable-mbstring`; dropped
+  `--with-onig` (PHP 8.x finds oniguruma via pkg-config; `PKG_CONFIG_PATH` is already
+  set and `lib/lib/pkgconfig/oniguruma.pc` exists). Without this fix the static mode
+  silently produces a binary WITHOUT mbstring (configure ignores unknown options) while
+  still linking libonig.a — check `configure: WARNING: unrecognized options:` in any
+  new static-mode work.
+- `packages/gd/static.mak`: dropped `--enable-png` (no such flag in 8.x; harmless noise).
+
+**Build:** standard per-version sequence (clear config cache → worker-mjs → node-mjs).
+Six measured batches on 8.4 first; the per-batch size table is in RESULTS Session 13.
+
+**Verification additions:** the canonical Worker demo (`worker/index.mjs`) now prints
+the floor sanity line and runs guarded functional probes per family (mb_strlen, DOM
+parse, openssl_random_pseudo_bytes, ZipArchive round-trip, gz round-trip, finfo
+buffer, imagecreatetruecolor). Note for JS-template PHP scripts: PHP string escapes
+like `\x89` must be written `\\x89` inside the template literal or JS consumes them
+first (caused a PHP parse error in this session).
+
+**Operational note:** when scripting wrangler smoke tests, kill workerd with
+`pkill -x workerd` (exact name) — `pkill -f workerd` matches any command line
+containing the string (e.g. `apply-workerd-patches.py`) including the calling shell;
+and bound every wait (`timeout 90 bash -c 'until curl …'`) with a log dump on expiry.
+
 ## Known fragile steps
 
 - **Exhaustive suspendable-imports list.** *Not a problem on this pipeline*

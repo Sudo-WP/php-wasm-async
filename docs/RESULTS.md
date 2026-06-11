@@ -1088,6 +1088,90 @@ Open item: production-D1 re-verification of the Session 11.5 meta measurements.
 
 ---
 
+## Session 13 — WordPress extension floor: complete, on both versions; over budget as measured (2026-06-11)
+
+**The full MUST-KEEP floor is statically linked and functional on 8.4.1 and 8.2.11.**
+All six batches built; every functional probe passes; the GOT/trampoline surface never
+changed (`vp`-only held through all six batches — open risk #3 stays closed). The
+combined two-binary bundle is now **15.89 MiB gz — 66% over the 10 MiB Paid limit**,
+crossing at batch 2 (projected) exactly as the ADR-0023 tripwire protocol anticipated.
+The fit-strategy decision is the next session's ADR, on these numbers.
+
+### The headline artifact — per-batch size table (8.4 worker, `gzip -9`)
+
+| Step | raw | gz | Δ raw | Δ gz |
+|---|---|---|---|---|
+| Session 12 base | 16,479,145 | 4,142,546 | — | — |
+| B1 mbstring + oniguruma | 18,713,137 | 4,983,222 | +2,233,992 | +840,676 |
+| B2 dom, simplexml, xml, xmlreader, xmlwriter | 22,802,101 | 6,030,294 | +4,088,964 | +1,047,072 |
+| B3 openssl (libssl+libcrypto, ThinLTO) | 28,314,955 | 7,449,082 | +5,512,854 | +1,418,788 |
+| B4 zip + zlib | 28,796,695 | 7,591,963 | +481,740 | +142,881 |
+| B5 fileinfo | 37,509,719 | 8,043,367 | **+8,713,024** | +451,404 |
+| B6 gd + png/jpeg/webp/freetype | **40,389,722** | **8,920,786** | +2,880,003 | +877,419 |
+
+**Floor total (8.4): +23.9 MB raw / +4,778,240 B gz (+4.56 MiB).**
+Final 8.2: 34,583,069 raw / 7,737,047 gz. **Combined: 16,657,833 B gz (15.89 MiB).**
+
+Notable: B2 was predicted "cheap since libxml is already in" — it was not (+1 MiB gz);
+the extension code itself under whole-program Asyncify is the mass, not the C library.
+B5's raw cost is the embedded libmagic database (+8.7 MB raw) but it compresses 19:1.
+B3 is the single largest gz increment (libcrypto). **Raw size is its own finding:**
+the 8.4 binary is now 38.5 MiB raw — cold-start instantiation cost needs measuring
+before production regardless of the compressed-fit strategy.
+
+### Pipeline findings (flag, don't work around)
+
+1. **The pipeline's mbstring static mode was broken for PHP 8.x**: it passed
+   `--with-mbstring` / `--with-onig`, both unrecognized by 8.x configure (silently
+   ignored → extension not built while libonig.a still linked). Fixed in
+   `packages/mbstring/static.mak`: `--enable-mbstring`, oniguruma via pkg-config
+   (`oniguruma.pc` already shipped). First observed as: batch-1 binary grew +672 KB
+   with `extension_loaded('mbstring') === false`.
+2. `packages/gd/static.mak` passed `--enable-png` (no such flag in 8.x; libpng is
+   pkg-config-detected) — harmless no-op, removed for warning hygiene.
+3. All other floor static modes were correct as shipped; no `$(error)` couplings, no
+   new GOT.func signatures from any of the six static libs.
+4. fileinfo has no pipeline package; `CONFIGURE_FLAGS+= --enable-fileinfo` in the env
+   file is sufficient (no Makefile change needed).
+
+### Verification (final, both versions)
+
+Sanity line (workerd, both versions, 2 requests each):
+`ext: mb dom sxml xml xr xw ssl zip zlib fi gd exif bc` — all 13 present.
+
+Functional probes (loaded ≠ functional), identical on 8.2.11 and 8.4.1:
+`mb_strlen("héllo wörld") = 11`; DOMDocument parse → `x`;
+`openssl_random_pseudo_bytes(8)` → 8 bytes; ZipArchive create/read round-trip → `hi`;
+`gzuncompress(gzcompress('ok'))` → `ok`; finfo->buffer() returns a MIME verdict
+(`application/octet-stream` for the truncated PNG-signature probe — libmagic wants an
+IHDR chunk before calling it image/png; the call path is what's proven);
+`imagecreatetruecolor(1,1)` → ok. Plus the standing demo: D1 via pdo_d1 + an
+fp_async_call interleave on every request.
+
+`get_loaded_extensions()` (8.4; 8.2 identical mod ordering):
+`Core,date,libxml,openssl,pcre,zlib,bcmath,ctype,dom,json,fileinfo,filter,gd,hash,SPL,mbstring,session,standard,PDO,pdo_d1,pib,random,Reflection,exif,SimpleXML,tokenizer,xml,xmlreader,xmlwriter,zip`
+
+Node V8: regression + suspend/resume + pdo_d1 mock harness — PASS ×2 versions.
+GOT/trampoline: zero codegen errors in every batch's wrangler log; `vp`-only.
+
+### The three exit options, with this session's numbers (decision = next ADR)
+
+| Option | Measured outcome |
+|---|---|
+| (i) Per-version Workers | **Fits today.** Each Worker carries one binary: 8.4 = 8.51 MiB gz, 8.2 = 7.38 MiB gz — both under 10 MiB with 1.5–2.6 MiB headroom. Cost: loses single-deployment header selection; two deployments to operate. |
+| (ii) JSPI port | The structural lever: whole-program Asyncify instrumentation is the dominant multiplier on every batch's extension-code cost (see B2). Unmeasured until built; expected to shrink both binaries substantially and improve the raw-size/cold-start picture too. |
+| (iii) Trim the floor | **Cannot reach 10 MiB combined alone.** The full floor costs +4.56 MiB gz against ~2.26 MiB of headroom; even dropping the two biggest optional batches (gd −0.84 + fileinfo −0.43 MiB gz) leaves the combined bundle ~14.3 MiB. Only useful in combination with (i) or (ii). |
+
+### Session 13 committed files
+
+- `patches/session13-extension-floor.patch` — env deltas (both versions) + the
+  mbstring/gd static.mak flag fixes
+- `worker/index.mjs` — canonical demo now carries the floor sanity line + functional
+  probes (guarded; degrades gracefully on older binaries)
+- `docs/DECISIONS.md` — ADR-0023 (committed first, per protocol)
+
+---
+
 ## Asyncify vs JSPI comparison
 
 *Pending Session 5.* To be recorded:

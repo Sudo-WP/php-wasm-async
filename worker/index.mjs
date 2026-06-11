@@ -30,18 +30,33 @@ const RUNTIMES = {
 };
 const DEFAULT_VERSION = '8.4';
 
-// Session 7/8 PHP script: two sequential fp_async_call invocations via D1.
-// Each call suspends on a real async D1 query and resumes with the row JSON.
-// PHP_VERSION is echoed so the served runtime version is externally observable.
+// Session 13 canonical demo: D1 via pdo_d1, fp_async_call interleave, the
+// WordPress extension-floor sanity line, and guarded functional probes
+// (loaded != functional — each family proves it actually works).
 const PHP_CODE = `<?php
-echo "before:\n";
-$r1 = fp_async_call('{"action":"query","sql":"SELECT value FROM config WHERE key=?","params":["greeting"]}');
-$r2 = fp_async_call('{"action":"query","sql":"SELECT value FROM config WHERE key=?","params":["farewell"]}');
-echo "after: " . $r1 . " / " . $r2 . "\n";
+echo "start\n";
+$pdo = new PDO('d1:main');
+$s = $pdo->prepare('SELECT value FROM config WHERE key = ?');
+$s->execute(['greeting']);
+echo "pdo: " . $s->fetchColumn() . "\n";
+$kv = fp_async_call('{"action":"query","sql":"SELECT value FROM config WHERE key=?","params":["farewell"]}');
+echo "fp: " . $kv . "\n";
 echo "php: " . PHP_VERSION . "\n";
-echo "ext: " . (extension_loaded('mysqli')?'mysqli ':'- ') . (extension_loaded('gd')?'gd ':'- ')
-    . (extension_loaded('curl')?'curl ':'- ') . (extension_loaded('mbstring')?'mb ':'- ')
-    . (extension_loaded('openssl')?'ssl ':'- ') . (extension_loaded('bcmath')?'bc':'-') . "\n";
+echo "ext: " . (extension_loaded('mbstring')?'mb ':'- ') . (extension_loaded('dom')?'dom ':'- ')
+    . (extension_loaded('simplexml')?'sxml ':'- ') . (extension_loaded('xml')?'xml ':'- ')
+    . (extension_loaded('xmlreader')?'xr ':'- ') . (extension_loaded('xmlwriter')?'xw ':'- ')
+    . (extension_loaded('openssl')?'ssl ':'- ') . (extension_loaded('zip')?'zip ':'- ')
+    . (extension_loaded('zlib')?'zlib ':'- ') . (extension_loaded('fileinfo')?'fi ':'- ')
+    . (extension_loaded('gd')?'gd ':'- ') . (extension_loaded('exif')?'exif ':'- ')
+    . (extension_loaded('bcmath')?'bc':'-') . "\n";
+if (extension_loaded('mbstring')) echo "mb_strlen: " . mb_strlen("héllo wörld") . "\n";
+if (extension_loaded('dom')) { $d = new DOMDocument(); $d->loadXML('<a><b>x</b></a>'); echo "dom: " . $d->getElementsByTagName('b')->item(0)->textContent . "\n"; }
+if (extension_loaded('openssl')) echo "openssl: " . strlen(openssl_random_pseudo_bytes(8)) . " bytes\n";
+if (extension_loaded('zip')) { $z = new ZipArchive(); $f = '/tmp/p.zip'; $z->open($f, ZipArchive::CREATE); $z->addFromString('t.txt', 'hi'); $z->close(); $z2 = new ZipArchive(); $z2->open($f); echo "zip: " . $z2->getFromName('t.txt') . "\n"; }
+if (extension_loaded('zlib')) echo "zlib: " . gzuncompress(gzcompress('ok')) . "\n";
+if (extension_loaded('fileinfo')) { $fi = new finfo(FILEINFO_MIME_TYPE); echo "finfo: " . $fi->buffer("\\x89PNG\\r\\n\\x1a\\n" . str_repeat("\\0", 16)) . "\n"; }
+if (extension_loaded('gd')) { $im = imagecreatetruecolor(1, 1); echo "gd: " . (($im !== false) ? "1x1 ok" : "fail") . "\n"; }
+echo "done\n";
 `;
 
 export default {
