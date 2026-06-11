@@ -269,9 +269,14 @@ clear (ADR-0021, option a). The ADR-0020 vrzno prototype is superseded and will 
 run; the upstream license inquiry is moot for our path.
 
 **Next session: clean-room D1 PDO driver (the main event).**
-- FIRST: confirm from Cloudflare D1 docs that `meta.last_row_id` / `meta.changes`
-  from `stmt.run()` suffice for `lastInsertId()` and affected-rows (carried-forward
-  open question #4 from RESEARCH-networking).
+- ~~FIRST: confirm `meta.last_row_id` / `meta.changes` sufficiency~~ **DONE
+  (Session 11.5, 2026-06-11):** measured in miniflare — `last_row_id` is per-insert
+  and reliable (incl. batch and rowid reuse); `changes` is **per-statement, not
+  cumulative**, and RETURNING-safe; `run()`/`all()` meta identical. pdo_d1 session
+  unblocked; no delta computation needed. See RESULTS "D1 meta verification
+  (pre-pdo_d1)" — including the 4-item production-D1 re-verification list
+  (miniflare is an emulation; probe committed at `worker/probes/d1-meta-probe.mjs`
+  for the re-run).
 - New static extension (e.g. `ext/pdo_d1`, ours, Apache-2.0) beside pib: PDO driver
   surface (prepare/execute/fetch + exec + lastInsertId + affected-rows + quote with
   real escaping + error propagation — the pdo_cfd1 stub list is the requirements

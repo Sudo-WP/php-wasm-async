@@ -949,6 +949,62 @@ sufficiency for `lastInsertId()`/affected-rows.
 
 ---
 
+## D1 meta verification (pre-pdo_d1, Session 11.5, 2026-06-11)
+
+JS-only probe (`worker/probes/d1-meta-probe.mjs`, run against the local miniflare D1
+binding) measuring the `meta` object the pdo_d1 driver will build `lastInsertId()`
+and `rowCount()`/`exec()` on. Motivation: Cloudflare's docs describe `changes` in
+`sqlite3_total_changes()` (cumulative) terms, and there is a community report of
+`changes: 0` on UPDATE…RETURNING — the driver must be designed against measurements.
+
+### Measured (miniflare; `served_by: "miniflare.db"`; full log in the probe output)
+
+| Statement | changes | last_row_id | notes |
+|---|---|---|---|
+| 1 CREATE TABLE | 0 | 5 (stale, pre-existing DB state) | `rows_written: 2` (schema tables) |
+| 2 INSERT A | 1 | **1** | |
+| 3 INSERT B | 1 | **2** | per-insert, not stale |
+| 4 UPDATE matching 2 rows | **2** | 2 (stale) | per-statement, NOT cumulative |
+| 5 UPDATE matching 0 rows | **0** | 2 (stale) | `changed_db: false` |
+| 6 UPDATE one row RETURNING * | **1** | 2 (stale) | community report NOT reproduced; results_len 1 |
+| 7 DELETE one row | **1** | 2 (stale) | |
+| 8a/8b SELECT via run() / all() | 0 / 0 | 2 / 2 (stale) | meta identical across run()/all() |
+| 8c SELECT with IN | 0 | 2 (stale) | `rows_written: 0` — community report not reproduced |
+| 9 INSERT C | 1 | **2** | correct: rowid 2 was freed by the DELETE and reused (INTEGER PRIMARY KEY without AUTOINCREMENT) |
+| 10 batch[0], batch[1] INSERTs | 1, 1 | **3, 4** | per-entry meta, correct per-statement values |
+| 11 INSERT via all() | 1 | **5** | INSERT meta identical via all() |
+
+### Conclusions
+
+**a) `last_row_id`: per-insert and reliable — yes.** Increments correctly per INSERT
+(1, 2), tracks rowid reuse after DELETE (9 → 2), and is correct per entry inside
+`.batch()` (3, 4). On non-INSERT statements it holds the connection's last inserted
+rowid (stale) — exactly `sqlite3_last_insert_rowid()` semantics, which is also PDO's:
+the driver reads it immediately after each INSERT and caches it for `lastInsertId()`.
+
+**b) `changes`: per-statement, NOT cumulative — and RETURNING-safe (in miniflare).**
+UPDATE matching 2 → `2`; matching 0 → `0`; RETURNING → `1`; DELETE → `1`. The docs'
+`sqlite3_total_changes()` wording does not match the measured behavior, which is
+per-statement (`sqlite3_changes()`-like). The driver can map `rowCount()`/`exec()`
+directly from `meta.changes` with **no delta computation** — with a production-D1
+re-check before the driver is declared done (see c).
+
+**c) Miniflare-vs-production re-verification list** (miniflare is an emulation;
+flag, don't assume parity):
+1. `changes` per-statement semantics (the cumulative docs wording) — re-measure on
+   real D1.
+2. UPDATE…RETURNING `changes` (the community report that motivated this probe was
+   not reproduced locally — it may be a production-only or since-fixed behavior).
+3. SELECT-with-IN `rows_written` (reported nonzero in production; 0 here).
+4. CREATE TABLE meta quirks (changes=0 but rows_written=2; stale last_row_id).
+The probe is committed (`worker/probes/d1-meta-probe.mjs`) precisely so the same
+sequence can be re-run against production D1 with one config change.
+
+Also measured: `.run()` and `.all()` return identical meta for the same statement;
+`.batch()` returns full per-entry meta (relevant to transactions-via-batch, Phase 2).
+
+---
+
 ## Asyncify vs JSPI comparison
 
 *Pending Session 5.* To be recorded:
