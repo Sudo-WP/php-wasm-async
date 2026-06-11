@@ -1,0 +1,679 @@
+diff --git a/source/pdo_d1/config.m4 b/source/pdo_d1/config.m4
+new file mode 100644
+index 00000000..ba21bebc
+--- /dev/null
++++ b/source/pdo_d1/config.m4
+@@ -0,0 +1,10 @@
++dnl php-wasm-async — pdo_d1 (Apache-2.0). See php_pdo_d1.h.
++PHP_ARG_ENABLE([pdo-d1],
++  [whether to enable the pdo_d1 driver for Cloudflare D1],
++  [AS_HELP_STRING([--enable-pdo-d1], [Enable pdo_d1 support])],
++  [no])
++
++if test "$PHP_PDO_D1" != "no"; then
++  PHP_NEW_EXTENSION(pdo_d1, pdo_d1.c, $ext_shared)
++  PHP_ADD_EXTENSION_DEP(pdo_d1, pdo)
++fi
+diff --git a/source/pdo_d1/pdo_d1.c b/source/pdo_d1/pdo_d1.c
+new file mode 100644
+index 00000000..b01c4219
+--- /dev/null
++++ b/source/pdo_d1/pdo_d1.c
+@@ -0,0 +1,572 @@
++/*
++ * php-wasm-async — pdo_d1: clean-room PDO driver for Cloudflare D1.
++ *
++ * Copyright 2026 the php-wasm-async contributors.
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *
++ * Phase 1 (ADR-0022): prepare/bind(positional)/execute/fetch, exec(),
++ * lastInsertId(), rowCount(), real error propagation, quote().
++ * Honest-stub policy: transactions and driver-level named parameters THROW.
++ * Marshalling: JSON strings across the EM_ASYNC_JS boundary; results parsed
++ * with PHP's own JSON API. Meta semantics per the MEASURED behavior
++ * (RESULTS "D1 meta verification"): meta.changes is per-statement;
++ * meta.last_row_id read after every successful statement (last-insert-rowid
++ * semantics). lastInsertId() caveat: WITHOUT-ROWID tables have no rowid —
++ * not used by WordPress core tables.
++ */
++
++#ifdef HAVE_CONFIG_H
++# include "config.h"
++#endif
++
++#include "php.h"
++#include "ext/standard/info.h"
++#include "ext/pdo/php_pdo.h"
++#include "ext/pdo/php_pdo_driver.h"
++#include "ext/json/php_json.h"
++#include "zend_smart_str.h"
++#include "zend_exceptions.h"
++#include <emscripten.h>
++#include "php_pdo_d1.h"
++
++/* ---------- JS boundary ---------------------------------------------- */
++
++/* Synchronous: does Module.d1[name] exist? */
++EM_JS(int, pdo_d1_js_has_db, (const char *name), {
++	return (typeof Module.d1 === 'object'
++		&& Module.d1 !== null
++		&& typeof Module.d1[UTF8ToString(name)] === 'object'
++		&& Module.d1[UTF8ToString(name)] !== null) ? 1 : 0;
++});
++
++/*
++ * Asynchronous: run one statement with positional params (JSON array),
++ * suspending the PHP stack until the D1 Promise settles (Asyncify; the
++ * mixed-packaging coexistence with fp_async_call was proven in Session 11).
++ * Always uses .all(): measured meta is identical to .run() and .all() also
++ * covers RETURNING. Returns a malloc'd JSON string:
++ *   {ok:true, results:[...], changes:N, last_row_id:N} | {ok:false, error:"..."}
++ */
++EM_ASYNC_JS(char *, pdo_d1_js_query, (const char *dbname, const char *sql, const char *params_json), {
++	let out;
++	try {
++		const name = UTF8ToString(dbname);
++		const db = Module.d1 && Module.d1[name];
++		if (!db) {
++			throw new Error('pdo_d1: Module.d1["' + name + '"] is not set');
++		}
++		const params = JSON.parse(UTF8ToString(params_json));
++		let stmt = db.prepare(UTF8ToString(sql));
++		if (params.length) {
++			stmt = stmt.bind(...params);
++		}
++		const r = await stmt.all();
++		out = {
++			ok: true,
++			results: r.results ?? [],
++			changes: (r.meta && typeof r.meta.changes === 'number') ? r.meta.changes : 0,
++			last_row_id: (r.meta && typeof r.meta.last_row_id === 'number') ? r.meta.last_row_id : 0,
++		};
++	} catch (e) {
++		out = { ok: false, error: String((e && e.message) || e) };
++	}
++	return stringToNewUTF8(JSON.stringify(out));
++});
++
++/* ---------- error handling ------------------------------------------- */
++
++static void pdo_d1_set_error(pdo_dbh_t *dbh, pdo_stmt_t *stmt, const char *msg)
++{
++	pdo_d1_db_handle *H = (pdo_d1_db_handle *)dbh->driver_data;
++	pdo_error_type *err = stmt ? &stmt->error_code : &dbh->error_code;
++
++	strcpy(*err, "HY000");
++
++	if (H->einfo.errmsg) {
++		pefree(H->einfo.errmsg, dbh->is_persistent);
++	}
++	H->einfo.errmsg = pestrdup(msg, dbh->is_persistent);
++}
++
++static void d1_fetch_error_func(pdo_dbh_t *dbh, pdo_stmt_t *stmt, zval *info)
++{
++	pdo_d1_db_handle *H = (pdo_d1_db_handle *)dbh->driver_data;
++
++	add_next_index_long(info, 1); /* driver-specific code: D1 does not expose one */
++	if (H->einfo.errmsg) {
++		add_next_index_string(info, H->einfo.errmsg);
++	}
++}
++
++/* ---------- shared statement runner ----------------------------------
++ * Runs sql with params (PHP array zval or NULL), parses the JSON reply.
++ * On success fills *out_results (owned by caller), *out_changes, updates
++ * H->last_row_id, returns 1. On failure sets the PDO error and returns 0. */
++static int pdo_d1_run(pdo_dbh_t *dbh, pdo_stmt_t *stmt_or_null,
++	const char *sql, zval *params, zval *out_results, zend_long *out_changes)
++{
++	pdo_d1_db_handle *H = (pdo_d1_db_handle *)dbh->driver_data;
++	smart_str params_buf = {0};
++	char *reply_raw;
++	zval reply, *z_ok, *z_err, *z_results, *z_changes, *z_lrid;
++	int ok = 0;
++
++	if (params && Z_TYPE_P(params) == IS_ARRAY) {
++		if (php_json_encode(&params_buf, params, 0) == FAILURE) {
++			pdo_d1_set_error(dbh, stmt_or_null, "pdo_d1: failed to encode parameters as JSON");
++			smart_str_free(&params_buf);
++			return 0;
++		}
++		smart_str_0(&params_buf);
++	} else {
++		smart_str_appendl(&params_buf, "[]", 2);
++		smart_str_0(&params_buf);
++	}
++
++	reply_raw = pdo_d1_js_query(ZSTR_VAL(H->dbname), sql, ZSTR_VAL(params_buf.s));
++	smart_str_free(&params_buf);
++
++	if (!reply_raw) {
++		pdo_d1_set_error(dbh, stmt_or_null, "pdo_d1: no reply from the JS boundary");
++		return 0;
++	}
++
++	ZVAL_UNDEF(&reply);
++	if (php_json_decode_ex(&reply, reply_raw, strlen(reply_raw),
++			PHP_JSON_OBJECT_AS_ARRAY, PHP_JSON_PARSER_DEFAULT_DEPTH) == FAILURE
++		|| Z_TYPE(reply) != IS_ARRAY) {
++		free(reply_raw);
++		pdo_d1_set_error(dbh, stmt_or_null, "pdo_d1: malformed reply from the JS boundary");
++		return 0;
++	}
++	free(reply_raw);
++
++	z_ok = zend_hash_str_find(Z_ARRVAL(reply), "ok", sizeof("ok") - 1);
++	if (z_ok && zend_is_true(z_ok)) {
++		z_results = zend_hash_str_find(Z_ARRVAL(reply), "results", sizeof("results") - 1);
++		z_changes = zend_hash_str_find(Z_ARRVAL(reply), "changes", sizeof("changes") - 1);
++		z_lrid    = zend_hash_str_find(Z_ARRVAL(reply), "last_row_id", sizeof("last_row_id") - 1);
++
++		if (out_results) {
++			if (z_results && Z_TYPE_P(z_results) == IS_ARRAY) {
++				ZVAL_COPY(out_results, z_results);
++			} else {
++				array_init(out_results);
++			}
++		}
++		if (out_changes) {
++			*out_changes = (z_changes ? zval_get_long(z_changes) : 0);
++		}
++		/* last-insert-rowid semantics: track after every successful statement */
++		if (z_lrid) {
++			H->last_row_id = zval_get_long(z_lrid);
++		}
++		ok = 1;
++	} else {
++		z_err = zend_hash_str_find(Z_ARRVAL(reply), "error", sizeof("error") - 1);
++		if (z_err && Z_TYPE_P(z_err) == IS_STRING) {
++			pdo_d1_set_error(dbh, stmt_or_null, Z_STRVAL_P(z_err));
++		} else {
++			pdo_d1_set_error(dbh, stmt_or_null, "pdo_d1: unknown D1 error");
++		}
++	}
++
++	zval_ptr_dtor(&reply);
++	return ok;
++}
++
++/* ---------- statement methods ----------------------------------------- */
++
++static int d1_stmt_dtor(pdo_stmt_t *stmt)
++{
++	pdo_d1_stmt *S = (pdo_d1_stmt *)stmt->driver_data;
++
++	if (S) {
++		zval_ptr_dtor(&S->results);
++		zval_ptr_dtor(&S->params);
++		if (S->query) {
++			zend_string_release(S->query);
++		}
++		efree(S);
++		stmt->driver_data = NULL;
++	}
++	return 1;
++}
++
++static int d1_stmt_execute(pdo_stmt_t *stmt)
++{
++	pdo_d1_stmt *S = (pdo_d1_stmt *)stmt->driver_data;
++	zval results;
++	zend_long changes = 0;
++
++	if (!pdo_d1_run(stmt->dbh, stmt, ZSTR_VAL(S->query),
++			&S->params, &results, &changes)) {
++		return 0;
++	}
++
++	zval_ptr_dtor(&S->results);
++	ZVAL_COPY_VALUE(&S->results, &results);
++
++	S->num_rows = zend_hash_num_elements(Z_ARRVAL(S->results));
++	S->curr = -1;
++	S->changes = changes;
++
++	/* rowCount(): rows for row-returning statements (SELECT / ... RETURNING),
++	 * meta.changes otherwise. Both are 0 for an empty SELECT / 0-row UPDATE. */
++	stmt->row_count = S->num_rows > 0 ? S->num_rows : changes;
++
++	/* column count from the first row's keys (D1 returns no schema for an
++	 * empty result set — fetchAll() on 0 rows yields [] with 0 columns). */
++	if (S->num_rows > 0) {
++		zval *row0 = zend_hash_index_find(Z_ARRVAL(S->results), 0);
++		stmt->column_count = (row0 && Z_TYPE_P(row0) == IS_ARRAY)
++			? (int)zend_hash_num_elements(Z_ARRVAL_P(row0)) : 0;
++	} else {
++		stmt->column_count = 0;
++	}
++
++	return 1;
++}
++
++static int d1_stmt_fetch(pdo_stmt_t *stmt, enum pdo_fetch_orientation ori, zend_long offset)
++{
++	pdo_d1_stmt *S = (pdo_d1_stmt *)stmt->driver_data;
++
++	/* forward-only cursor (D1 returns the full result set) */
++	if (S->curr + 1 >= S->num_rows) {
++		return 0;
++	}
++	S->curr++;
++	return 1;
++}
++
++static int d1_stmt_describe_col(pdo_stmt_t *stmt, int colno)
++{
++	pdo_d1_stmt *S = (pdo_d1_stmt *)stmt->driver_data;
++	zval *row0;
++	zend_string *key;
++	zend_ulong num_key;
++	int i = 0;
++
++	if (colno >= stmt->column_count || S->num_rows == 0) {
++		return 0;
++	}
++	row0 = zend_hash_index_find(Z_ARRVAL(S->results), 0);
++	if (!row0 || Z_TYPE_P(row0) != IS_ARRAY) {
++		return 0;
++	}
++
++	ZEND_HASH_FOREACH_KEY(Z_ARRVAL_P(row0), num_key, key) {
++		if (i == colno) {
++			stmt->columns[colno].name = key
++				? zend_string_copy(key)
++				: zend_long_to_str((zend_long)num_key);
++			stmt->columns[colno].maxlen = SIZE_MAX;
++			stmt->columns[colno].precision = 0;
++			return 1;
++		}
++		i++;
++	} ZEND_HASH_FOREACH_END();
++
++	return 0;
++}
++
++static int d1_stmt_get_col(pdo_stmt_t *stmt, int colno, zval *result, enum pdo_param_type *type)
++{
++	pdo_d1_stmt *S = (pdo_d1_stmt *)stmt->driver_data;
++	zval *row, *val;
++	int i = 0;
++
++	if (S->curr < 0 || S->curr >= S->num_rows || colno >= stmt->column_count) {
++		return 0;
++	}
++	row = zend_hash_index_find(Z_ARRVAL(S->results), S->curr);
++	if (!row || Z_TYPE_P(row) != IS_ARRAY) {
++		return 0;
++	}
++
++	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(row), val) {
++		if (i == colno) {
++			ZVAL_COPY(result, val); /* native JSON types: int/float/string/null */
++			return 1;
++		}
++		i++;
++	} ZEND_HASH_FOREACH_END();
++
++	return 0;
++}
++
++static int d1_stmt_param_hook(pdo_stmt_t *stmt, struct pdo_bound_param_data *param, enum pdo_param_event event_type)
++{
++	pdo_d1_stmt *S = (pdo_d1_stmt *)stmt->driver_data;
++
++	if (!param->is_param) {
++		return 1; /* bound result columns are handled by PDO core */
++	}
++
++	if (event_type != PDO_PARAM_EVT_EXEC_PRE) {
++		return 1;
++	}
++
++	/* Driver-level named parameters are not implemented (Phase 1). PDO core
++	 * rewrites :name to positional for this driver (PDO_PLACEHOLDER_POSITIONAL),
++	 * so a named param reaching the driver means something unexpected. */
++	if (param->paramno < 0) {
++		zend_throw_exception_ex(php_pdo_get_exception(), 0,
++			"pdo_d1: driver-level named parameters are not implemented (Phase 1, ADR-0022); use positional placeholders");
++		return 0;
++	}
++
++	{
++		zval *zv = &param->parameter;
++		ZVAL_DEREF(zv);
++		zval copy;
++		/* honor the declared type so D1 sees native JSON types */
++		switch (param->param_type & ~PDO_PARAM_INPUT_OUTPUT) {
++			case PDO_PARAM_INT:
++				ZVAL_LONG(&copy, zval_get_long(zv));
++				break;
++			case PDO_PARAM_BOOL:
++				ZVAL_BOOL(&copy, zend_is_true(zv));
++				break;
++			case PDO_PARAM_NULL:
++				ZVAL_NULL(&copy);
++				break;
++			default:
++				ZVAL_COPY(&copy, zv);
++		}
++		zend_hash_index_update(Z_ARRVAL(S->params), (zend_ulong)param->paramno, &copy);
++	}
++
++	return 1;
++}
++
++static const struct pdo_stmt_methods d1_stmt_methods = {
++	d1_stmt_dtor,
++	d1_stmt_execute,
++	d1_stmt_fetch,
++	d1_stmt_describe_col,
++	d1_stmt_get_col,
++	d1_stmt_param_hook,
++	NULL, /* set_attribute */
++	NULL, /* get_attribute */
++	NULL, /* get_column_meta */
++	NULL, /* next_rowset */
++	NULL, /* cursor_closer */
++};
++
++/* ---------- database handle methods ------------------------------------ */
++
++static void d1_handle_closer(pdo_dbh_t *dbh)
++{
++	pdo_d1_db_handle *H = (pdo_d1_db_handle *)dbh->driver_data;
++
++	if (H) {
++		if (H->dbname) {
++			zend_string_release(H->dbname);
++		}
++		if (H->einfo.errmsg) {
++			pefree(H->einfo.errmsg, dbh->is_persistent);
++		}
++		pefree(H, dbh->is_persistent);
++		dbh->driver_data = NULL;
++	}
++}
++
++static bool d1_handle_preparer(pdo_dbh_t *dbh, zend_string *sql, pdo_stmt_t *stmt, zval *driver_options)
++{
++	pdo_d1_db_handle *H = (pdo_d1_db_handle *)dbh->driver_data;
++	pdo_d1_stmt *S = ecalloc(1, sizeof(pdo_d1_stmt));
++
++	S->H = H;
++	array_init(&S->results);
++	array_init(&S->params);
++	S->curr = -1;
++
++	stmt->driver_data = S;
++	stmt->methods = &d1_stmt_methods;
++	/* D1 .bind() is positional. pdo_parse_params rewrites :name → ? and
++	 * builds stmt->bound_param_map (PDO core only calls it for
++	 * PLACEHOLDER_NONE drivers; positional drivers call it themselves —
++	 * the pdo_mysql/pdo_pgsql pattern). */
++	stmt->supports_placeholders = PDO_PLACEHOLDER_POSITIONAL;
++
++	{
++		zend_string *nsql = NULL;
++		int ret = pdo_parse_params(stmt, sql, &nsql);
++		if (ret == 1) {
++			S->query = nsql;            /* rewritten */
++		} else if (ret == 0) {
++			S->query = zend_string_copy(sql); /* unchanged */
++		} else {
++			/* parse error; error_code set by pdo_parse_params */
++			efree(S);
++			stmt->driver_data = NULL;
++			return false;
++		}
++	}
++
++	return true;
++}
++
++static zend_long d1_handle_doer(pdo_dbh_t *dbh, const zend_string *sql)
++{
++	zend_long changes = 0;
++
++	/* REAL exec(): runs the statement, returns affected rows (meta.changes). */
++	if (!pdo_d1_run(dbh, NULL, ZSTR_VAL(sql), NULL, NULL, &changes)) {
++		return -1;
++	}
++	return changes;
++}
++
++static zend_string *d1_handle_quoter(pdo_dbh_t *dbh, const zend_string *unquoted, enum pdo_param_type paramtype)
++{
++	/* SQLite-style: single quotes doubled, wrapped in single quotes.
++	 * Prepared statements are the supported path; quote() exists for
++	 * completeness. Strings containing NUL cannot be quoted safely. */
++	const char *in = ZSTR_VAL(unquoted);
++	size_t in_len = ZSTR_LEN(unquoted);
++
++	if (memchr(in, '\0', in_len) != NULL) {
++		return NULL;
++	}
++
++	smart_str out = {0};
++	smart_str_appendc(&out, '\'');
++	for (size_t i = 0; i < in_len; i++) {
++		if (in[i] == '\'') {
++			smart_str_appendc(&out, '\'');
++		}
++		smart_str_appendc(&out, in[i]);
++	}
++	smart_str_appendc(&out, '\'');
++	smart_str_0(&out);
++
++	return out.s;
++}
++
++/* Honest stubs (ADR-0022): D1 has no interactive transactions; batch() is
++ * its primitive. Phase 2 decides the strategy. Throwing beats lying. */
++static bool d1_handle_txn_unsupported(pdo_dbh_t *dbh)
++{
++	zend_throw_exception_ex(php_pdo_get_exception(), 0,
++		"pdo_d1: transactions are not implemented (Phase 1, ADR-0022; D1 has no interactive transactions)");
++	return false;
++}
++
++static zend_string *d1_handle_last_id(pdo_dbh_t *dbh, const zend_string *name)
++{
++	pdo_d1_db_handle *H = (pdo_d1_db_handle *)dbh->driver_data;
++
++	/* meta.last_row_id of the most recent statement on this handle
++	 * (last-insert-rowid semantics; measured — RESULTS "D1 meta verification").
++	 * Caveat: WITHOUT-ROWID tables have no rowid (not used by WordPress). */
++	return zend_long_to_str(H->last_row_id);
++}
++
++static const struct pdo_dbh_methods d1_db_methods = {
++	d1_handle_closer,
++	d1_handle_preparer,
++	d1_handle_doer,
++	d1_handle_quoter,
++	d1_handle_txn_unsupported, /* begin */
++	d1_handle_txn_unsupported, /* commit */
++	d1_handle_txn_unsupported, /* rollback */
++	NULL,                      /* set_attribute */
++	d1_handle_last_id,
++	d1_fetch_error_func,
++	NULL,                      /* get_attribute */
++	NULL,                      /* check_liveness */
++	NULL,                      /* get_driver_methods */
++	NULL,                      /* persistent_shutdown */
++	NULL,                      /* in_transaction: PDO-internal tracking */
++	NULL,                      /* get_gc */
++	/* (8.4 'scanner' member left zero-initialized; absent in 8.2) */
++};
++
++static int pdo_d1_handle_factory(pdo_dbh_t *dbh, zval *driver_options)
++{
++	pdo_d1_db_handle *H;
++
++	if (dbh->data_source == NULL || *dbh->data_source == '\0') {
++		zend_throw_exception_ex(php_pdo_get_exception(), 0,
++			"pdo_d1: DSN must name a database: new PDO('d1:<name>') with Module.d1 = { '<name>': <D1Database> }");
++		return 0;
++	}
++
++	if (!pdo_d1_js_has_db(dbh->data_source)) {
++		zend_throw_exception_ex(php_pdo_get_exception(), 0,
++			"pdo_d1: Module.d1[\"%s\"] is not set — the Worker must inject the D1 binding before PHP runs",
++			dbh->data_source);
++		return 0;
++	}
++
++	H = pecalloc(1, sizeof(pdo_d1_db_handle), dbh->is_persistent);
++	H->dbname = zend_string_init(dbh->data_source, dbh->data_source_len, dbh->is_persistent);
++	H->last_row_id = 0;
++	H->einfo.errmsg = NULL;
++
++	dbh->driver_data = H;
++	dbh->methods = &d1_db_methods;
++	dbh->max_escaped_char_length = 2;
++	dbh->alloc_own_columns = 1;
++
++	return 1;
++}
++
++const pdo_driver_t pdo_d1_driver = {
++	PDO_DRIVER_HEADER(d1),
++	pdo_d1_handle_factory,
++};
++
++/* ---------- module boilerplate ----------------------------------------- */
++
++PHP_MINIT_FUNCTION(pdo_d1)
++{
++	return php_pdo_register_driver(&pdo_d1_driver);
++}
++
++PHP_MSHUTDOWN_FUNCTION(pdo_d1)
++{
++	php_pdo_unregister_driver(&pdo_d1_driver);
++	return SUCCESS;
++}
++
++PHP_MINFO_FUNCTION(pdo_d1)
++{
++	php_info_print_table_start();
++	php_info_print_table_row(2, "PDO driver for Cloudflare D1 (pdo_d1)", "enabled");
++	php_info_print_table_row(2, "Module.d1 detected",
++		EM_ASM_INT({ return (typeof Module.d1 === 'object' && Module.d1 !== null) ? 1 : 0; }) ? "yes" : "no");
++	php_info_print_table_end();
++}
++
++static const zend_module_dep pdo_d1_deps[] = {
++	ZEND_MOD_REQUIRED("pdo")
++	ZEND_MOD_END
++};
++
++zend_module_entry pdo_d1_module_entry = {
++	STANDARD_MODULE_HEADER_EX, NULL,
++	pdo_d1_deps,
++	"pdo_d1",
++	NULL,
++	PHP_MINIT(pdo_d1),
++	PHP_MSHUTDOWN(pdo_d1),
++	NULL,
++	NULL,
++	PHP_MINFO(pdo_d1),
++	PHP_PDO_D1_VERSION,
++	STANDARD_MODULE_PROPERTIES,
++};
++
++#ifdef COMPILE_DL_PDO_D1
++ZEND_GET_MODULE(pdo_d1)
++#endif
+diff --git a/source/pdo_d1/php_pdo_d1.h b/source/pdo_d1/php_pdo_d1.h
+new file mode 100644
+index 00000000..67cfe0e0
+--- /dev/null
++++ b/source/pdo_d1/php_pdo_d1.h
+@@ -0,0 +1,48 @@
++/*
++ * php-wasm-async — pdo_d1: clean-room PDO driver for Cloudflare D1.
++ *
++ * Copyright 2026 the php-wasm-async contributors.
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *
++ * See docs/DECISIONS.md ADR-0022. Implemented against PHP's own PDO driver
++ * API (ext/pdo/php_pdo_driver.h); ext/pdo_sqlite used as the pattern
++ * reference. The Worker injects D1 bindings as Module.d1 = { name: binding };
++ * PHP connects with new PDO('d1:name'). Suspension via EM_ASYNC_JS
++ * (coexistence with pib/fp_async_call proven in Session 11).
++ */
++
++#ifndef PHP_PDO_D1_H
++#define PHP_PDO_D1_H
++
++extern zend_module_entry pdo_d1_module_entry;
++#define phpext_pdo_d1_ptr &pdo_d1_module_entry
++
++#define PHP_PDO_D1_VERSION "0.1.0"
++
++typedef struct {
++	char *errmsg;            /* pestrdup'd D1/driver error message, or NULL */
++} pdo_d1_error_info;
++
++typedef struct {
++	zend_string *dbname;     /* name after "d1:" — key into Module.d1 */
++	zend_long last_row_id;   /* last_row_id of the most recent statement */
++	pdo_d1_error_info einfo;
++} pdo_d1_db_handle;
++
++typedef struct {
++	pdo_d1_db_handle *H;
++	zval results;            /* PHP array of rows (assoc arrays) from JSON */
++	zend_long num_rows;
++	zend_long curr;          /* current row index; -1 before first fetch */
++	zend_long changes;       /* meta.changes of the last execute */
++	zval params;             /* positional params: index → value */
++	zend_string *query;      /* SQL to run (post named→positional rewrite) */
++} pdo_d1_stmt;
++
++#endif /* PHP_PDO_D1_H */
+--- a/Makefile
++++ b/Makefile
+@@ -289,6 +289,11 @@
+ third_party/php${PHP_VERSION}-src/ext/pib/pib.c: source/pib/pib.c
+ 	@ ${DOCKER_RUN} cp -prf source/pib third_party/php${PHP_VERSION}-src/ext/
+ 
++# php-wasm-async (Session 12): pdo_d1 — clean-room Apache-2.0 PDO driver for
++# Cloudflare D1 (ADR-0022). Same injection pattern as pib.
++third_party/php${PHP_VERSION}-src/ext/pdo_d1/pdo_d1.c: source/pdo_d1/pdo_d1.c source/pdo_d1/php_pdo_d1.h source/pdo_d1/config.m4
++	@ ${DOCKER_RUN} cp -prf source/pdo_d1 third_party/php${PHP_VERSION}-src/ext/
++
+ ########### Build the objects. ###########
+ 
+ ifneq (${WITH_NETWORKING},0)
+@@ -334,7 +339,7 @@
+ 
+ DEPENDENCIES+= ${ENV_FILE} ${ARCHIVES}
+ 
+-third_party/php${PHP_VERSION}-src/configured: ${ENV_FILE} ${ARCHIVES} ${PHP_CONFIGURE_DEPS} third_party/php${PHP_VERSION}-src/patched third_party/php${PHP_VERSION}-src/ext/pib/pib.c
++third_party/php${PHP_VERSION}-src/configured: ${ENV_FILE} ${ARCHIVES} ${PHP_CONFIGURE_DEPS} third_party/php${PHP_VERSION}-src/patched third_party/php${PHP_VERSION}-src/ext/pib/pib.c third_party/php${PHP_VERSION}-src/ext/pdo_d1/pdo_d1.c
+ 	@ echo -e "\e[33;4mConfiguring PHP ${PHP_SUFFIX}\e[0m"
+ 	${DOCKER_RUN_IN_PHP} which autoconf
+ 	${DOCKER_RUN_IN_PHP} emconfigure ./buildconf --force
+@@ -351,6 +356,7 @@
+ 		--enable-cli       \
+ 		--enable-embed=static \
+ 		--enable-pib       \
++		--enable-pdo-d1    \
+ 		--enable-json      \
+ 		--enable-pdo       \
+ 		--disable-all      \

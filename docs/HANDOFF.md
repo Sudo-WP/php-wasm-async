@@ -25,7 +25,19 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Session 11 PASS (2026-06-11) — Asyncify mixed-packaging coexistence proven
+**Phase:** Session 12 PASS (2026-06-11) — **pdo_d1 Phase 1 shipped** (ADR-0022). The
+clean-room Apache-2.0 D1 PDO driver builds and passes all gates on 8.4.1 AND 8.2.11:
+prepare/bind/execute/fetch*, real exec() (meta.changes), real lastInsertId()
+(meta.last_row_id), real rowCount(), PDOException with the D1 error text, safe
+quote(), named params via PDO core's rewriter (driver calls pdo_parse_params in its
+preparer — the POSITIONAL-driver pattern), typed binds. Transactions throw honestly
+(Phase 2). workerd: full PDO session against miniflare D1 with an fp_async_call
+interleave, both versions via header selection, 2 requests each. Driver cost: ~16 KB
+raw / ~3–4 KB gz per binary. GOT still vp-only. Worker now sets
+`mod.d1 = { main: env.DB }` permanently. Probe/mock deliverables:
+`tests/test-pdo-d1-mock.mjs`; source as `patches/session12-pdo-d1.patch`.
+
+**Session 11 state (still true).** Session 11 PASS (2026-06-11) — Asyncify mixed-packaging coexistence proven
 (ADR-0021). A throwaway `EM_ASYNC_JS` suspender (`fp_async_probe`) ran interleaved
 with the JS-library `fp_async_call` in one PHP execution in workerd: four suspensions,
 two mechanisms, alternating, correct values, two consecutive requests. No trampoline/
@@ -139,6 +151,9 @@ unwind/rewind is stateless across calls. Node V8 regression: PASS (stub fallback
 - `docs/DECISIONS.md` — ADR-0017
 
 **What all sessions established (all true):**
+- Session 12 PASS: pdo_d1 Phase 1 — clean-room Apache-2.0 D1 PDO driver, all surfaces
+  real (the pdo_cfd1 stub list), both PHP versions, ~16 KB raw cost. `new PDO('d1:main')`
+  works in workerd against miniflare D1, interleaved with fp_async_call (ADR-0022).
 - Session 11 PASS: EM_ASYNC_JS + JS-library Asyncify imports coexist in one binary in
   workerd, interleaved (4 suspensions/run). Clears the clean-room D1 PDO driver
   (ADR-0021, option a). GOT still `vp`-only; EM_ASYNC_JS overhead negligible.
@@ -264,28 +279,25 @@ both Node V8 and Cloudflare Workers / workerd, against real async host operation
 
 ## Next action
 
-**Session 11 PASS.** Coexistence proven; the path to the clean-room D1 PDO driver is
-clear (ADR-0021, option a). The ADR-0020 vrzno prototype is superseded and will not
-run; the upstream license inquiry is moot for our path.
+**Session 12 PASS.** pdo_d1 Phase 1 shipped on both versions. The DB hot path for the
+WordPress target now exists end-to-end: `new PDO('d1:main')` → EM_ASYNC_JS → D1.
 
-**Next session: clean-room D1 PDO driver (the main event).**
-- ~~FIRST: confirm `meta.last_row_id` / `meta.changes` sufficiency~~ **DONE
-  (Session 11.5, 2026-06-11):** measured in miniflare — `last_row_id` is per-insert
-  and reliable (incl. batch and rowid reuse); `changes` is **per-statement, not
-  cumulative**, and RETURNING-safe; `run()`/`all()` meta identical. pdo_d1 session
-  unblocked; no delta computation needed. See RESULTS "D1 meta verification
-  (pre-pdo_d1)" — including the 4-item production-D1 re-verification list
-  (miniflare is an emulation; probe committed at `worker/probes/d1-meta-probe.mjs`
-  for the re-run).
-- New static extension (e.g. `ext/pdo_d1`, ours, Apache-2.0) beside pib: PDO driver
-  surface (prepare/execute/fetch + exec + lastInsertId + affected-rows + quote with
-  real escaping + error propagation — the pdo_cfd1 stub list is the requirements
-  list), suspending via EM_ASYNC_JS (proven Session 11), D1 binding injected as a
-  Module property by the Worker (same loader pattern as `Module.hostAsyncCall`).
-- PDO driver API knowledge comes from PHP's own headers/docs (`pdo_dbh_t` /
-  `pdo_stmt_t` method tables — PHP License, fine); pdo_cfd1 was read for facts only
-  (ADR-0003 discipline).
+**Potential next sessions:**
 
-**After that (unchanged):** WordPress extension floor (static link); WP-side shims
-(Requests transport + db.php-style DB shim — can start anytime); JSPI port; R2/DO
-consumers; PHP patch-version bump.
+1. **pdo_d1 Phase 2.** Transactions strategy (batch-based emulation vs documented
+   no-transaction mode + WP-side handling — D1's `.batch()` per-entry meta is already
+   measured, Session 11.5); `getAttribute`/`setAttribute` minimum; production-D1
+   re-verification of the meta semantics (4-item list in RESULTS, needs a deployed
+   Worker).
+
+2. **WP-side shims.** The `db.php` drop-in targeting pdo_d1 (Playground
+   wp-sqlite-db pattern, MySQL→SQLite translation, GPL-side) and the Requests
+   transport on `fp_async_call` (`{action:"fetch",…}`). The runtime surfaces they
+   need are now both in place.
+
+3. **WordPress extension floor (static link).** Unchanged from Session 9; pdo_d1
+   removes sqlite3/pdo_sqlite and mysqli from the must-add list (DB goes through
+   pdo_d1), shrinking the floor to: mbstring(+oniguruma), openssl, dom/xml/simplexml,
+   zip, gd(+image libs), fileinfo.
+
+4. **JSPI port; R2/DO consumers; PHP patch-version bump.** Unchanged.

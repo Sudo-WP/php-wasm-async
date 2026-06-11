@@ -93,6 +93,11 @@ async function runPhp(env, version) {
     // Session 6 KV handler (kept for reference — not active):
     // mod.hostAsyncCall = async (key) => (await env.KV.get(key)) ?? '';
 
+    // pdo_d1 (Session 12, ADR-0022): D1 bindings for the clean-room PDO driver.
+    // PHP connects with new PDO('d1:main'). This is the driver's own surface;
+    // fp_async_call/hostAsyncCall above stays the generic host-async primitive.
+    mod.d1 = { main: env.DB };
+
     await mod.ccall('pib_storage_init', 'number', [], [], {async: true});
 
     if (!mod.FS.analyzePath('/preload').exists) {

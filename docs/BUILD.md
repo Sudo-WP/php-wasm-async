@@ -710,6 +710,47 @@ done
 # Session 9 final: 8.2 raw=15934663 gz=3977584 ; 8.4 raw=16462783 gz=4139775
 ```
 
+### Session 12 — pdo_d1: clean-room D1 PDO driver (validated 2026-06-11)
+
+**Goal:** Phase 1 of the Apache-2.0 D1 PDO driver (ADR-0022). New static extension
+`pdo_d1` beside `pib`, suspending via EM_ASYNC_JS (Session 11 pattern).
+
+**Sources** (committed as `patches/session12-pdo-d1.patch`, applied on top of the
+session 2/3/iconv/5/6/8/9 stack):
+- `source/pdo_d1/pdo_d1.c`, `php_pdo_d1.h`, `config.m4` — the driver (Apache-2.0)
+- `Makefile` — ext copy rule (same injection pattern as pib: copied into
+  `php-src/ext/pdo_d1/` before configure), `--enable-pdo-d1` configure flag, and the
+  `configured` dependency on the copied source.
+
+**Build** (full Session 2-shape rebuild per version — new ext → reconfigure):
+
+```bash
+cd ~/scratch/php-wasm-upstream
+docker run --rm -v $(pwd):/src seanmorris/php-emscripten-builder:latest \
+    bash -c "rm -f /src/.cache/config-cache /src/third_party/php8.4-src/configured"
+make PHP_VERSION=8.4 ENV_FILE=.circleci/.env_8.4.ci worker-mjs
+make PHP_VERSION=8.4 ENV_FILE=.circleci/.env_8.4.ci node-mjs
+# repeat for 8.2
+```
+
+Expected warning on 8.4 only: `missing field 'scanner' initializer` for
+`d1_db_methods` — deliberate; 8.4 added a `scanner` member to `pdo_dbh_methods` that
+8.2 lacks, and positional initialization (zero-filled tail) compiles on both.
+
+**Worker wiring** (`worker/index.mjs`, permanent): `mod.d1 = { main: env.DB };`
+before `pib_init`. PHP side: `new PDO('d1:main')`.
+
+**Mock harness** (gate 2, no workerd needed): `tests/test-pdo-d1-mock.mjs` — copy to
+the scratch root and run `PHP_VERSION=8.4 node test-pdo-d1-mock.mjs`. It injects a
+mock `Module.d1` (canned results/meta + a rejecting statement) on the resolved
+`php.binary` module and exercises every Phase 1 surface.
+
+**Driver-pattern note for future PDO work:** PDO core calls `pdo_parse_params` itself
+only for `PLACEHOLDER_NONE` (emulating) drivers. A `PDO_PLACEHOLDER_POSITIONAL` driver
+must call `pdo_parse_params` in its preparer to get `:name` → `?` rewriting and
+`bound_param_map` (the pdo_mysql/pdo_pgsql pattern). Without it, named params reach
+the driver unresolved (`paramno == -1`).
+
 ## Known fragile steps
 
 - **Exhaustive suspendable-imports list.** *Not a problem on this pipeline*

@@ -1005,6 +1005,89 @@ Also measured: `.run()` and `.all()` return identical meta for the same statemen
 
 ---
 
+## Session 12 — pdo_d1 Phase 1: PASS on both versions (2026-06-11)
+
+**PASS.** The clean-room, Apache-2.0 D1 PDO driver (`pdo_d1`, ADR-0022) builds and
+passes every gate on PHP 8.4.1 **and** 8.2.11: full Node mock-harness coverage, and the
+real thing against miniflare D1 in workerd — including an `fp_async_call` interleave
+mid-PDO-session. Every row of the pdo_cfd1 stub table is REAL in this driver.
+
+### Implementation notes (what the gates surfaced)
+
+- **Named parameters work via PDO core's rewriter** — better than the planned throw.
+  Finding: PDO core only calls `pdo_parse_params` itself for `PLACEHOLDER_NONE`
+  drivers; a POSITIONAL driver must call it in its own preparer (the
+  pdo_mysql/pdo_pgsql pattern). `pdo_d1` does, getting `:name` → `?` rewriting +
+  `bound_param_map` for free. The driver-level named-param throw remains as a safety
+  net.
+- **`execute([...])` binds as `PDO_PARAM_STR`** (standard PDO semantics) — params
+  cross the JSON boundary as strings; SQLite/D1 column affinity handles comparisons.
+  `bindValue(..., PDO::PARAM_INT/BOOL/NULL)` passes native JSON types (the driver
+  honors `param_type`).
+- **8.4 vs 8.2 PDO API delta: one field.** 8.4 adds a `scanner` member at the end of
+  `pdo_dbh_methods`; the driver uses positional initializers that omit it (legal C,
+  zero-initialized), compiling warning-clean-but-for-that on 8.4 and cleanly on 8.2.
+  No other API differences — the dual-build promise (Session 8) holds.
+- Statement execution always uses D1 `.all()` (meta identical to `.run()`, covers
+  RETURNING — Session 11.5 measurements).
+
+### Gate evidence
+
+**Gate 1 (Node regression):** unchanged PASS both versions (fp_async_call untouched).
+
+**Gate 2 (Node mock harness, `tests/test-pdo-d1-mock.mjs`):** PASS both versions —
+connect, fetch/fetchAll/fetchObject/fetchColumn, typed binds, lastInsertId 42 (canned),
+update rowCount 3, real exec(), `quote("it's")` → `'it''s'`, named-rewrite, PDOException
+carrying the mock's D1_ERROR message, transactions throw honestly, bad DSN throws.
+
+**Gate 3 (workerd, miniflare D1, both versions via X-PHP-Version, 2 requests each):**
+
+```
+start
+select: hello from D1                              ← prepare/execute/fetchColumn
+lastInsertId: 1 / lastInsertId2: 2                 ← real meta.last_row_id per INSERT
+update rowCount: 2                                 ← real meta.changes
+interleave fp_async_call: {"value":"goodbye from D1"}  ← both mechanisms in one run
+rows: ["z","z"]                                    ← fetchAll(FETCH_COLUMN)
+exception: has D1 message                          ← PDOException w/ D1 error text
+php: 8.4.1 | 8.2.11
+done
+```
+
+`exec()` of CREATE TABLE/DELETE actually executes (the table exists and is reused
+across requests).
+
+**Gate 4 (GOT/trampoline, open risk #3):** zero code-generation/`Table.set` errors in
+the wrangler log with the driver's two additional EM_JS/EM_ASYNC_JS imports — `vp`-only
+trampoline still suffices.
+
+**Gate 5 (size, gzip -9):**
+
+| | raw | gz | Δ vs Session 9 |
+|---|---|---|---|
+| 8.4 + pdo_d1 | 16,479,145 | 4,142,546 | +16,362 raw / +2,771 gz |
+| 8.2 + pdo_d1 | 15,951,297 | 3,981,728 | +16,634 raw / +4,144 gz |
+
+The whole driver costs ~16 KB raw / ~3-4 KB gz per binary. Combined bundle still
+~7.75 MiB gz — comfortably inside the 10 MB Paid limit.
+
+### Deferred (honest throws, Phase 2)
+
+`beginTransaction`/`commit`/`rollBack` throw with an ADR-0022 reference (D1 has no
+interactive transactions; batch() is its primitive — Phase 2 decides the strategy).
+Driver-level named binding throws (unreachable in practice — core rewrites first).
+Open item: production-D1 re-verification of the Session 11.5 meta measurements.
+
+### Session 12 committed files
+
+- `patches/session12-pdo-d1.patch` — `source/pdo_d1/{pdo_d1.c,php_pdo_d1.h,config.m4}`
+  + Makefile wiring (`--enable-pdo-d1`, ext copy rule, configured dep)
+- `tests/test-pdo-d1-mock.mjs` — the gate-2 mock harness (run from the scratch root)
+- `worker/index.mjs` — permanent `mod.d1 = { main: env.DB }` injection
+- `docs/DECISIONS.md` — ADR-0022 (committed first, per protocol)
+
+---
+
 ## Asyncify vs JSPI comparison
 
 *Pending Session 5.* To be recorded:
