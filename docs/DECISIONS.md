@@ -10,6 +10,55 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0022 — Session 12: pdo_d1 architecture — clean-room D1 PDO driver, Phase 1
+**Date:** 2026-06-11 · **Status:** Accepted · **Builds on:** ADR-0021 (coexistence proven), Session 11.5 (D1 meta measured)
+
+**Decision.** Implement `pdo_d1`, this project's own Apache-2.0 PDO driver for
+Cloudflare D1, as a second static extension beside `pib`. Named `pdo_d1` — not
+`cfd1` — to avoid any naming overlap with the unlicensed prototype.
+
+**Clean-room discipline.** The pdo-cfd1/vrzno sources are not consulted, copied, or
+re-read. References: `docs/RESEARCH-networking.md` (the recorded facts), PHP's own
+`ext/pdo/php_pdo_driver.h` (the PDO driver API is PHP's, PHP License — implementing
+against it is what every PDO driver does), and php-src's `ext/pdo_sqlite` as the
+pattern reference (reading PHP itself, already part of our derivation). Every new
+file carries an Apache-2.0 header.
+
+**Architecture (binding):**
+1. **Own injection surface:** the Worker sets `Module.d1 = { <name>: <D1Database> }`
+   (deliberately NOT `Module.cfd1`); PHP connects with `new PDO('d1:<name>')`.
+2. **Suspension:** `EM_ASYNC_JS` functions inside the extension awaiting the D1
+   binding directly — the exact pattern Session 11 validated.
+3. **Marshalling:** JSON strings across the EM_ASYNC_JS boundary
+   (`{ok, results, meta}` / `{ok:false, error}`), parsed C-side with PHP's own JSON
+   API. No object-proxy machinery — deliberately simpler than the vrzno approach.
+4. **Division of labor (recorded as the standing rule):** `pdo_d1` owns the DB hot
+   path with a direct D1 await (fewer marshalling hops); `fp_async_call` remains the
+   generic host-async primitive for everything else (KV, R2, fetch, future stores).
+   Neither routes through the other.
+5. **Honest-stub policy:** deferred surfaces THROW ("pdo_d1: X not implemented…")
+   rather than silently no-op — the pdo_cfd1 failure mode this project will not
+   repeat. Phase 1 defers: transactions (D1 has no interactive transactions;
+   `batch()` is its primitive — Phase 2 decides batch-emulation vs documented
+   no-transaction mode), named `:param` binding (positional `?` only), and
+   non-essential attributes.
+6. **Phase 1 surface (all REAL, per the requirements list = pdo_cfd1's stub table):**
+   DSN parse + handle factory with clear errors; prepare/bind(positional)/execute/
+   fetch/fetchAll/fetchObject/fetchColumn; `exec()` returning `meta.changes`;
+   `lastInsertId()` from `meta.last_row_id` (WITHOUT-ROWID caveat documented;
+   non-issue for WP tables); `rowCount()` = results length for row-returning
+   statements, `meta.changes` otherwise; error propagation as PDOException/errorInfo
+   carrying the D1 message; `quote()` with SQLite single-quote doubling (prepared
+   statements remain the supported path).
+7. **Meta semantics implemented to the MEASURED behavior** (Session 11.5): `changes`
+   is per-statement and RETURNING-safe in miniflare; `last_row_id` read after every
+   successful statement (sqlite last-insert-rowid semantics). Production-D1
+   re-verification remains an open item (RESULTS list).
+8. Statement execution always uses D1 `.all()` — Session 11.5 measured identical
+   meta from `.run()`/`.all()`, and `.all()` also covers RETURNING.
+
+---
+
 ## ADR-0021 — Session 11: option (a) chosen — clean-room D1 PDO driver on our primitive; coexistence proven with our own probe instead of a vrzno prototype
 **Date:** 2026-06-11 · **Status:** Accepted · **Resolves:** ADR-0020's deferred (a)-vs-(b) choice
 
