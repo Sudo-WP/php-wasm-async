@@ -48,9 +48,10 @@ their value is years of accumulated edge cases. Two-layer structure:
 Requests 2.x `WpOrg\Requests\Transport` interface, sending
 `{action:"fetch", url, method, headers, body, timeout}` through `fp_async_call`
 (consumer-owned JSON, ADR-0017 convention) and reconstructing a Requests-shaped
-response. The Requests library itself is **BSD-3-Clause** (GitHub: NOASSERTION at
-repo level; the library ships BSD) — the few interface files needed for standalone
-harness loading are vendored with attribution. Registration uses the supported WP
+response. The Requests library itself is **ISC-licensed** *(correction during
+implementation: the vendored LICENSE file is ISC, © 2010-2012 Ryan McCue and
+contributors — not BSD as first drafted)* — the interface file needed for standalone
+harness loading is vendored with attribution. Registration uses the supported WP
 6.x mechanism (verified during implementation and documented in BUILD).
 
 **4. Worker `fetch` action + security caveat.** `worker/run-php.mjs` gains a

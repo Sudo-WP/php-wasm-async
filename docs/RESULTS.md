@@ -1193,6 +1193,86 @@ suite on both Workers. Config/loader surgery only — binaries unchanged from S1
 
 ---
 
+## Session 15 — WP-side shims, validated by micro-harness: 10/10 PASS both versions (2026-06-12)
+
+**PASS.** The `db.php` drop-in (pdo_d1 connection layer + adapted
+sqlite-database-integration translator) and the `FP_Async_Transport` Requests
+transport (HTTP via `fp_async_call` → Worker fetch) both work against the live
+runtime. Harness: **10/10 PASS on 8.4.1 (×2 consecutive requests) and 8.2.11 (×2)**.
+No PHP rebuild. Translator adapted from WordPress/sqlite-database-integration
+**v2.2.23 (`f3ea1a43ba525be382c7a9c17735b6b4d4b11d49`, GPL-2.0)** — the last
+classic-translator release line; current upstream `main` is the unreleased AST
+monorepo (revisit when it ships).
+
+### Harness results (identical on both versions)
+
+```
+CHECK 1  PASS  translated CREATE TABLE (AUTO_INCREMENT + KEY)
+CHECK 2  PASS  insert_id sequence: 1, 2
+CHECK 3  PASS  rows_affected after UPDATE: 1
+CHECK 4  PASS  get_results: typed rows (stringified per translator config)
+CHECK 5  PASS  SHOW TABLES LIKE → sqlite_master translation
+CHECK 6  PASS  failing query → last_error populated, no fatal
+CHECK 7  PASS  transaction path survived (see note below)
+CHECK 8  PASS  GET https://example.com/ → HTTP/1.1 200 OK, 559 B, headers reconstructed
+CHECK 9  PASS  blocked URL → clean allowlist error, no hang
+CHECK 10 PASS  DB → HTTP → DB interleave in one execution
+SUMMARY: 10 PASS, 0 FAIL        php: 8.4.1 | 8.2.11
+```
+
+**Transaction-path honesty note (CHECK 7):** miniflare's local D1 ACCEPTS raw
+`BEGIN`/`COMMIT` — the real-transaction path ran locally, not the degradation
+path. Production D1 rejects them. The degradation path (disable-once + notice +
+level-tracking no-ops) is therefore exercised in **Node** with a production-like
+mock that rejects BEGIN: `tests/test-wp-shims-node.mjs` — PASS on both versions,
+notice logged, execution continues. This miniflare/production split is itself a
+finding: local-D1 permits more than production; transaction behavior must be on
+the production re-verification list (with the Session 11.5 meta items).
+
+### The D1-DIVERGENCE list (primary deliverable; markers in the source)
+
+| # | Divergence | Handling | Found |
+|---|---|---|---|
+| 1 | PHP UDFs (`sqliteCreateFunction`) impossible — D1 cannot call into PHP; MySQL functions emulated via UDFs (DATE_FORMAT, FIELD, REGEXP, …) unavailable | registration guarded; queries using them will error | analytic |
+| 2 | Init PRAGMAs: production D1 allows only a small subset; `encoding`/`journal_mode` rejected | try/catch guards; journal_mode never issued | analytic |
+| 3 | Interactive transactions rejected (`BEGIN`/`COMMIT`/`ROLLBACK`) | graceful degradation: disable-once flag + notice; WP runs without transactions | analytic; **exercised in Node** (miniflare accepts BEGIN — see note) |
+| 4 | `SELECT SQLITE_VERSION()` blocked ("not authorized to use function") — **even in miniflare** | try/catch, nominal '3.40.0' fallback | **live** (first harness run) |
+| 5 | Named-placeholder reuse (`:datatype` twice in the data-types-cache upsert) fails — pdo_d1 is a native-positional driver; PDO does not bind a reused named marker without emulation (pdo_sqlite's native named support masked this upstream) | upsert rewritten to `excluded.mysql_type` (standard SQLite, no reuse) | **live** (D1: "Wrong number of parameter bindings") |
+| 6 | ATTACH-based ALTER TABLE paths (translator's tempschema strategy) | untouched and UNEXERCISED — flagged as the top risk for dbDelta-heavy flows in the core boot | analytic |
+| 7 | File-backed bootstrap (FQDB/FQDBDIR, .htaccess writing) | unused — PDO injected; constants defined as inert placeholders | analytic |
+
+Divergence #5 is a **divergence class**, not a one-off: any translator SQL that
+reuses a named placeholder will fail on pdo_d1. Future adaptation work should grep
+for repeated `:name` per statement.
+
+### Other findings
+
+- The Requests 2.x registration mechanism: `WpOrg\Requests\Requests::add_transport()`
+  is the supported path; WP's old `http_api_transports` filter is deprecated (6.4+)
+  and never reaches Requests 2 transports. Requests is **ISC**-licensed (ADR-0025
+  corrected from BSD).
+- MEMFS seeding (11 PHP files, ~330 KB total) via wrangler Text-module rules +
+  `FS.writeFile` worked without incident — no S16-relevant structural problems
+  surfaced at this scale; the open question remains WordPress-scale (thousands of
+  files), not the mechanism.
+- Worker `fetch` action runs behind an explicit allowlist
+  (`https://example.com/` only). **Production needs a real egress policy — SSRF
+  surface** (ADR-0025 caveat, carried in HANDOFF).
+- Node suite green: regression, pdo_d1 mock, and the new `test-wp-shims-node.mjs`
+  (production-like txn rejection + fetch contract + allowlist error), both versions.
+
+### Session 15 committed files
+
+- `wp-shims/` — LICENSE (GPL-2.0), README (attribution), `db.php`, `sqlite/*`
+  (7 vendored/adapted files), `requests-transport/*` (transport + ISC interface +
+  registration snippet), `harness/*`
+- `worker/run-php.mjs` — fetch action (allowlisted) + `?harness=1` MEMFS seeding
+- `wrangler.toml` — Text-module rules for `.php`
+- `tests/test-wp-shims-node.mjs` — the production-like Node validation
+- README/NOTICE — dual-license layout; `docs/DECISIONS.md` — ADR-0025 (first)
+
+---
+
 ## Asyncify vs JSPI comparison
 
 *Pending Session 5.* To be recorded:

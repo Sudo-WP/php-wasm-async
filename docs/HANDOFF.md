@@ -25,7 +25,21 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Session 14 done (2026-06-12, no rebuild) — **fit strategy decided and
+**Phase:** Session 15 PASS (2026-06-12, no rebuild) — **the WP-side shims work
+against the live runtime.** `wp-shims/` (GPL-2.0-or-later, fenced — ADR-0025):
+`db.php` drop-in (pdo_d1 connection layer + sqlite-database-integration v2.2.23
+translator, 7 D1-DIVERGENCE adaptations) and `FP_Async_Transport` (WP Requests 2.x
+transport over `fp_async_call` → Worker fetch with allowlist). Micro-harness:
+**10/10 PASS on 8.4 (×2) and 8.2 (×2)** — translated DDL, insert_id, rows_affected,
+SHOW TABLES, error path, transaction path, HTTP GET/blocked, DB→HTTP→DB interleave.
+Two LIVE divergences found and fixed: D1 blocks `SQLITE_VERSION()` (even in
+miniflare); pdo_d1 (native-positional) forbids named-placeholder reuse → upsert
+rewritten to `excluded.*` (a divergence CLASS — grep repeated `:name` in any future
+translator SQL). Transaction degradation is proven in Node with a production-like
+mock (miniflare ACCEPTS BEGIN — local/production split recorded; production
+re-verification list grows by one). SSRF caveat on the fetch action stands.
+
+**Session 14 state (still true).** Session 14 done (2026-06-12, no rebuild) — **fit strategy decided and
 deployed (ADR-0024): per-version Workers.** `wrangler.toml` now defines
 `[env.php84]`/`[env.php82]`, each with its own entry (`worker/php84.mjs`/`php82.mjs`,
 shared core in `worker/run-php.mjs`) carrying exactly one binary. Per-env `main`
@@ -173,6 +187,9 @@ unwind/rewind is stateless across calls. Node V8 regression: PASS (stub fallback
 - `docs/DECISIONS.md` — ADR-0017
 
 **What all sessions established (all true):**
+- Session 15 PASS: wp-shims validated — db.php→pdo_d1 + Requests transport→
+  fp_async_call, 10/10 harness checks both versions; D1-DIVERGENCE list recorded
+  (ADR-0025).
 - Session 14: per-version Workers deployed (ADR-0024); both pass the full suite;
   multi-version single-Worker pattern superseded for production; UPSTREAM.md exists.
 - Session 13 PASS: full WP extension floor static on both versions, functionally
@@ -307,24 +324,28 @@ both Node V8 and Cloudflare Workers / workerd, against real async host operation
 
 ## Next action
 
-**Session 14 done.** Fit strategy decided and deployed (ADR-0024): per-version
-Workers, both verified. Deployment shape is now production-aligned.
+**Session 15 PASS.** Both WP-side adapters validated against the live runtime;
+the harness is the regression vehicle for everything WordPress-shaped.
 
-**Next session: WP-side shims + first WordPress bootstrap attempt.**
-- `db.php` drop-in targeting pdo_d1 (Playground wp-sqlite-db pattern: MySQL→SQLite
-  dialect translation over PDO; lives in WordPress GPL-land, separate from this
-  Apache-2.0 runtime — ADR-0003 boundary).
-- WP Requests transport on `fp_async_call` (`{action:"fetch",…}` payload via the
-  registered handler) — wp_remote_* without curl.
-- Then: boot a minimal WordPress against the 8.4 Worker. All runtime surfaces
-  exist (pdo_d1 + the full extension floor + the generic primitive). Expect new
-  findings (filesystem layout, FS persistence, missing niceties) — that's the point.
-- The thin edge router (site → Worker mapping) stays a downstream-integration
-  concern; dev uses ports 8791/8792.
+**Next session: Session 16 — filesystem strategy investigation.** The last gap
+before a WordPress boot: how does WP core (thousands of PHP files, ~60 MB) get
+into the Worker's filesystem?
+- Candidates to measure: MEMFS seeding at request time (S15 proved the mechanism
+  at 11-file scale; cost at WP scale unknown), bundle-time packaging, lazy-load
+  through the bridge (R2/KV via fp_async_call or a custom Emscripten FS), with
+  WordPress Playground's approach as prior art (investigate how it ships core).
+- The S15 production re-verification list rides along: D1 meta semantics
+  (S11.5), transaction rejection behavior, PRAGMA subset — one deployed-Worker
+  session can clear all of it.
+- Note: the parallel Containers spike is happening OUTSIDE this repo (no business
+  detail here); its outcome may reshape priorities but not this repo's runtime work.
 
 **Scheduled / unchanged:**
-1. **JSPI port** — required, not optional, if the floor grows (ADR-0024 caveat);
-   also the lever for the 38.5 MiB-raw cold-start concern.
-2. **pdo_d1 Phase 2** — transactions strategy, attributes, production-D1 meta
-   re-verification (RESULTS 11.5 list).
-3. R2/DO consumers; PHP patch-version bump; UPSTREAM.md filings (maintainer's call).
+1. **WordPress bootstrap** — after S16 decides the filesystem strategy.
+2. **JSPI port** — required if the floor grows (ADR-0024 caveat); also the
+   38.5 MiB-raw cold-start lever.
+3. **pdo_d1 Phase 2** — transactions strategy (now informed by the S15
+   degradation evidence), attributes, production-D1 re-verification.
+4. **Production egress policy for the fetch action** (SSRF — before any
+   non-allowlisted deployment).
+5. R2/DO consumers; PHP patch-version bump; UPSTREAM.md filings (maintainer's call).

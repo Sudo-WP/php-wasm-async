@@ -57,6 +57,13 @@ Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). The runtime is
 built on a clean-derivation path from permissively-licensed prior art; see
 `docs/DECISIONS.md` ADR-0001 and ADR-0003.
 
+**Dual-license layout:** everything under [`wp-shims/`](wp-shims/) is
+**GPL-2.0-or-later** (it runs inside WordPress as drop-ins/mu-plugins and
+adapts GPL prior art) and is licensed separately from the Apache-2.0 runtime.
+The runtime does not include or link the shim code; interaction is at arm's
+length (a PDO DSN and PHP function calls). See `wp-shims/README.md` and
+ADR-0025.
+
 This project is not affiliated with or endorsed by the PHP Group. In
 accordance with the PHP License naming restriction, "PHP" is not used in the
 project's product name.

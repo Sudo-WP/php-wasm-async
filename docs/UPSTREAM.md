@@ -65,3 +65,24 @@ tag per release, like the rest of the pipeline's third_party pins), mentioning
 the missing licenses in the same breath as a hygiene observation. Note: we are
 NOT requesting licenses for our own use — ADR-0021 made that moot (we built our
 own driver); this is a report for the benefit of the upstream ecosystem.
+
+---
+
+## 4. WordPress/sqlite-database-integration — named-placeholder reuse breaks native-positional PDO drivers (issue/PR candidate)
+
+**Status:** TO FILE
+
+**What & why.** The data-types-cache upsert (classic translator, v2.2.x line)
+reuses a named placeholder in one statement:
+`VALUES (:table, :column, :datatype) ... DO UPDATE SET mysql_type = :datatype`.
+On PDO drivers without native named-parameter support (native-positional +
+PDO's rewriter — e.g. mysqlnd in native-prepare mode, or any custom driver),
+PDO documentedly does not bind a reused named marker, producing "wrong number
+of parameter bindings". pdo_sqlite's native named support masks this. The fix
+is also better SQLite: `DO UPDATE SET mysql_type = excluded.mysql_type` (no
+reuse, standard upsert form). Found live in our Session 15 harness against
+Cloudflare D1 via our pdo_d1 driver.
+
+**Lives in our tree:** `wp-shims/sqlite/class-wp-sqlite-translator.php`
+(D1-DIVERGENCE marker at the upsert). Note when filing: upstream's new
+AST-based driver (current main) should be checked for the same pattern.

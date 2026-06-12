@@ -11,6 +11,13 @@ name = "php-wasm-async-poc"
 main = "worker/php84.mjs"
 compatibility_date = "2024-09-23"
 
+# wp-shims PHP files are bundled as Text modules and seeded into MEMFS for
+# the ?harness=1 mode (Session 15). Rules are inheritable by named envs.
+[[rules]]
+type = "Text"
+globs = ["**/*.php"]
+fallthrough = true
+
 [[kv_namespaces]]
 binding = "KV"
 id = "local-dev-only"

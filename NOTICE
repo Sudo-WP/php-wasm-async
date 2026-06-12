@@ -80,3 +80,15 @@ The build approach draws on prior PHP-to-WebAssembly work:
 - WordPress Playground's PHP-WASM build pipeline — referenced for factual
   information only (e.g. which functions must be made suspendable); no code
   was copied. See docs/DECISIONS.md ADR-0003.
+
+================================================================================
+Dual-license layout  (wp-shims/)
+================================================================================
+
+The wp-shims/ subdirectory is licensed GPL-2.0-or-later, separately from the
+Apache-2.0 runtime covered by this NOTICE. It contains WordPress-side code
+(drop-ins / mu-plugins) including material adapted from
+WordPress/sqlite-database-integration v2.2.23 (GPL-2.0-or-later) and a
+vendored interface from WordPress/Requests v2.0.15 (ISC). The runtime does
+not include or link any wp-shims/ code. See wp-shims/README.md and
+docs/DECISIONS.md ADR-0025.

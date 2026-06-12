@@ -825,6 +825,37 @@ the combined bundle fits the limit — it was the Session 13 extension floor
 (15.89 MiB gz combined) that retired it for production-shaped builds, not any
 defect. The pattern lives in git history (`worker/index.mjs` before Session 14).
 
+### Session 15 — wp-shims + harness (validated 2026-06-12; no rebuild)
+
+**Layout:** `wp-shims/` (GPL-2.0-or-later, fenced from the Apache-2.0 runtime —
+ADR-0025): `db.php` (D1 connection layer), `sqlite/` (adapted
+sqlite-database-integration v2.2.23 translator — `D1-DIVERGENCE:` markers),
+`requests-transport/` (`FP_Async_Transport` + vendored ISC Requests interface +
+`register-transport.php` using `Requests::add_transport()`, the supported WP 6.x
+mechanism), `harness/` (10 checks).
+
+**Worker wiring:** `worker/run-php.mjs` bundles the shim PHP files as Text
+modules (`[[rules]] type="Text" globs=["**/*.php"]` in wrangler.toml — rules are
+inherited by named envs) and seeds them into MEMFS under `/wp-shims/` when the
+request has `?harness=1`. The hostAsyncCall handler gains the `fetch` action,
+restricted to the harness allowlist (`https://example.com/`); production needs a
+real egress policy (SSRF — ADR-0025 caveat).
+
+**Run the harness:**
+
+```bash
+wrangler dev --local --env php84 --port 8791
+curl "http://localhost:8791/?harness=1"      # SUMMARY: 10 PASS, 0 FAIL
+# 8.2: --env php82 --port 8792, same expectation
+```
+
+**Node-side validation (covers what miniflare can't):**
+`tests/test-wp-shims-node.mjs` (copy to the scratch root) runs the translator
+against a production-like mock D1 that REJECTS `BEGIN` — exercising the
+transaction degradation path — plus the fetch-action contract and allowlist
+error. miniflare's local D1 accepts BEGIN/COMMIT, so only Node covers the
+production transaction behavior until a deployed-Worker re-verification.
+
 ## Known fragile steps
 
 - **Exhaustive suspendable-imports list.** *Not a problem on this pipeline*
