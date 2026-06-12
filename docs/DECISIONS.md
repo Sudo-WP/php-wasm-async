@@ -10,6 +10,63 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0025 — Session 15: WP-side shims — in-repo GPL boundary, adapted SQLite-integration translator, Requests transport on fp_async_call
+**Date:** 2026-06-12 · **Status:** Accepted
+
+**1. License boundary: `wp-shims/` subdirectory, GPL-2.0-or-later, in-repo.**
+Everything under `wp-shims/` is GPL-2.0-or-later, runs INSIDE WordPress (drop-ins /
+mu-plugins), and is licensed separately from the Apache-2.0 runtime in the rest of
+the repo. The runtime neither includes nor links this code; interaction is at arm's
+length (the `d1:` PDO DSN, `fp_async_call()` calls). Rationale for in-repo over a
+second repository: single-project coherence — the shims co-evolve with the runtime
+surfaces they target; the boundary is the directory plus its own LICENSE/README,
+echoed in the root README and NOTICE. GPL code may be adapted INTO `wp-shims/`;
+Apache-2.0 runtime code never moves into it in a way that would relicense it.
+
+**2. db.php: adapt, don't rewrite.** The MySQL→SQLite translation layer is adapted
+from WordPress/sqlite-database-integration at **tag v2.2.23, commit
+`f3ea1a43ba525be382c7a9c17735b6b4d4b11d49`** (GPL-2.0) — the last classic-translator
+release line (current `main` is the new 43k-line AST monorepo: too large, too new,
+and unreleased for WordPress use; revisit when it ships as the stable plugin). The
+translator/lexer/token/rewriter files are vendored as close to verbatim as possible —
+their value is years of accumulated edge cases. Two-layer structure:
+- **Connection/driver layer (ours, new):** `new PDO('d1:main')` replaces the
+  `sqlite:` file DSN + filesystem setup; `insert_id` ← `lastInsertId()`,
+  `rows_affected` ← `rowCount()`, `last_error` ← PDOException messages (all real
+  since Session 12). Transactions: pdo_d1 throws honestly (ADR-0022) — the drop-in
+  catches and degrades gracefully (notice, not fatal; WP core runs without
+  transactions).
+- **Translation layer (adapted):** divergences from file-SQLite assumptions are
+  stubbed with explicit `D1-DIVERGENCE:` comments and listed in RESULTS. Known
+  classes going in: PDO ctor/filesystem bootstrap; init PRAGMAs (only
+  `foreign_keys` is D1-supported); `sqliteCreateFunction` PHP-UDF registration
+  (impossible on D1 — it cannot call back into PHP; MySQL functions emulated via
+  UDFs are unavailable); ATTACH-based ALTER TABLE paths. AUTO_INCREMENT translates
+  to SQLite AUTOINCREMENT (no rowid reuse — the Session 11.5 finding).
+
+**3. Requests transport on fp_async_call.** A small GPL class implementing the
+Requests 2.x `WpOrg\Requests\Transport` interface, sending
+`{action:"fetch", url, method, headers, body, timeout}` through `fp_async_call`
+(consumer-owned JSON, ADR-0017 convention) and reconstructing a Requests-shaped
+response. The Requests library itself is **BSD-3-Clause** (GitHub: NOASSERTION at
+repo level; the library ships BSD) — the few interface files needed for standalone
+harness loading are vendored with attribution. Registration uses the supported WP
+6.x mechanism (verified during implementation and documented in BUILD).
+
+**4. Worker `fetch` action + security caveat.** `worker/run-php.mjs` gains a
+`fetch` action in the hostAsyncCall handler. The harness handler is restricted to
+an explicit URL allowlist. **Recorded caveat: production needs a real egress
+policy — this is an SSRF surface** (a Worker-side fetch on behalf of PHP). Flagged,
+not designed, in this session.
+
+**5. Validation vehicle:** a micro-harness (a few PHP files seeded into MEMFS at
+request time), NOT a WordPress boot — the filesystem strategy is Session 16's
+question. 10 checks: translator DDL, insert_id, rows_affected, get_results,
+MySQL-flavored SQL, error path, graceful-transaction path, allowlisted fetch,
+blocked fetch, DB→HTTP→DB interleave.
+
+---
+
 ## ADR-0024 — Session 14: fit strategy — per-version Workers now; JSPI scheduled; floor-trimming rejected
 **Date:** 2026-06-12 · **Status:** Accepted · **Decides on:** the Session 13 measurements (RESULTS S13); **resolves:** ADR-0023's deferred fit-strategy choice
 
