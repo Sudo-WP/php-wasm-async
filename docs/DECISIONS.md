@@ -10,6 +10,47 @@ earlier one is marked **Superseded** with a pointer.
 
 ---
 
+## ADR-0024 — Session 14: fit strategy — per-version Workers now; JSPI scheduled; floor-trimming rejected
+**Date:** 2026-06-12 · **Status:** Accepted · **Decides on:** the Session 13 measurements (RESULTS S13); **resolves:** ADR-0023's deferred fit-strategy choice
+
+**DECIDED — (i) per-version Workers, adopted now.** Each Worker carries exactly one
+PHP binary. Fits today on the Session 13 numbers: 8.4 = 8,920,786 B gz (8.51 MiB),
+8.2 = 7,737,047 B gz (7.38 MiB) — each under the 10 MiB Paid limit, with 1.5 / 2.6 MiB
+headroom respectively. The combined single-Worker bundle (15.89 MiB gz) does not fit
+and is retired for production-shaped builds.
+
+**Rationale beyond fit.** Per-version Workers are also the better production
+architecture for the downstream multi-site target: a site is pinned to one PHP
+version, so per-version Workers mean smaller cold starts (one binary instantiated,
+not two bundled), independent deploys per version (an 8.2 fix doesn't redeploy 8.4),
+and no dead binary weight on any request. The `X-PHP-Version` request-header
+selection (ADR-0018) becomes a deploy-time property; the response header
+`X-PHP-Version-Served` is kept so each Worker remains externally verifiable.
+
+**SCHEDULED — (ii) JSPI port stays the structural lever, not optional if the floor
+grows.** Session 13's xml-batch finding stands: whole-program Asyncify roughly
+doubles every extension's code cost, and 38.5 MiB raw (8.4) is its own cold-start
+concern. (i) and (ii) compose — JSPI later shrinks each per-version Worker.
+
+**REJECTED — (iii) floor-trimming.** Arithmetic (RESULTS S13): the floor costs
++4.56 MiB gz against ~2.26 MiB of single-Worker headroom; even dropping gd+fileinfo
+leaves ~14.3 MiB combined. Trimming can only ever complement (i)/(ii).
+
+**CAVEAT (explicit, for future readers).** (i) buys time, not a future. The 8.4
+binary has ~1.5 MiB gz headroom; the floor may still grow (intl/ICU if multilingual
+demand arrives — ADR-0019 left it out deliberately, and ICU is multi-MiB). If the
+floor grows, JSPI moves from scheduled to required. Do not read (i) as the permanent
+answer.
+
+**Deployment consequences (this session).** Each version gets its own Worker entry
+(importing only its binary) and its own wrangler config surface; dev runs them on two
+ports (8791 = 8.4, 8792 = 8.2). The thin edge router that picks a site's Worker is a
+downstream-integration concern, out of this repo's scope (noted in HANDOFF). The
+multi-version single-Worker pattern remains documented in BUILD.md as
+superseded-for-production knowledge.
+
+---
+
 ## ADR-0023 — Session 13: the WordPress extension floor — static-link plan, batches, and the size-tripwire protocol
 **Date:** 2026-06-11 · **Status:** Accepted · **Builds on:** ADR-0019 (static/dynamic split), ADR-0022 (pdo_d1 removes mysqli + sqlite from the floor)
 
