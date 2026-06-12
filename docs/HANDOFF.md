@@ -25,7 +25,19 @@ stores are simply the first consumers. See `DESIGN.md`.
 
 ## Current state
 
-**Phase:** Session 13 PASS (2026-06-11) — **the WordPress extension floor is complete
+**Phase:** Session 14 done (2026-06-12, no rebuild) — **fit strategy decided and
+deployed (ADR-0024): per-version Workers.** `wrangler.toml` now defines
+`[env.php84]`/`[env.php82]`, each with its own entry (`worker/php84.mjs`/`php82.mjs`,
+shared core in `worker/run-php.mjs`) carrying exactly one binary. Per-env `main`
+verified working on wrangler 4.96.0. Version selection is deploy-time; the
+`X-PHP-Version-Served` header stays. Both Workers pass the full standing suite
+(dev ports 8791/8792). The multi-version single-Worker pattern is superseded for
+production-shaped builds (documented in BUILD). JSPI remains scheduled — required,
+not optional, if the floor grows. `docs/UPSTREAM.md` created (3 seeded findings);
+the thin edge router that picks a site's Worker is a downstream-integration concern,
+not a runtime one.
+
+**Session 13 state (still true).** Session 13 PASS (2026-06-11) — **the WordPress extension floor is complete
 on both versions** (ADR-0023): mbstring, dom/simplexml/xml/xmlreader/xmlwriter,
 openssl, zip/zlib, fileinfo, gd (+exif/bcmath from before) all statically linked and
 **functionally probed** in workerd on 8.4.1 and 8.2.11. GOT stayed `vp`-only through
@@ -161,6 +173,8 @@ unwind/rewind is stateless across calls. Node V8 regression: PASS (stub fallback
 - `docs/DECISIONS.md` — ADR-0017
 
 **What all sessions established (all true):**
+- Session 14: per-version Workers deployed (ADR-0024); both pass the full suite;
+  multi-version single-Worker pattern superseded for production; UPSTREAM.md exists.
 - Session 13 PASS: full WP extension floor static on both versions, functionally
   probed; floor costs +4.56 MiB gz (8.4); combined bundle 15.89 MiB gz — over the
   Paid limit; per-version Workers fit today (8.51 / 7.38 MiB each); JSPI is the
@@ -293,26 +307,24 @@ both Node V8 and Cloudflare Workers / workerd, against real async host operation
 
 ## Next action
 
-**Session 13 PASS — and the fit-strategy decision is now forced.** The floor is
-complete and functional, but the combined bundle (15.89 MiB gz) exceeds the 10 MiB
-Paid limit. **Next session's FIRST step is ADR-0024: choose the fit strategy** on the
-measured numbers (RESULTS Session 13):
+**Session 14 done.** Fit strategy decided and deployed (ADR-0024): per-version
+Workers, both verified. Deployment shape is now production-aligned.
 
-- **(i) Per-version Workers — fits today** (8.4 = 8.51 MiB gz, 8.2 = 7.38 MiB gz,
-  each under 10 MiB with headroom). Cheapest path to deployable; loses
-  single-deployment header selection (router Worker or DNS/route split instead).
-- **(ii) JSPI port — the structural lever.** Asyncify instrumentation multiplies
-  every extension's code cost (see batch 2); JSPI removes it and helps the
-  38.5 MiB-raw cold-start concern too. Worth measuring soon regardless of (i).
-- **(iii) Trim — only as a complement**; cannot reach 10 MiB combined alone.
+**Next session: WP-side shims + first WordPress bootstrap attempt.**
+- `db.php` drop-in targeting pdo_d1 (Playground wp-sqlite-db pattern: MySQL→SQLite
+  dialect translation over PDO; lives in WordPress GPL-land, separate from this
+  Apache-2.0 runtime — ADR-0003 boundary).
+- WP Requests transport on `fp_async_call` (`{action:"fetch",…}` payload via the
+  registered handler) — wp_remote_* without curl.
+- Then: boot a minimal WordPress against the 8.4 Worker. All runtime surfaces
+  exist (pdo_d1 + the full extension floor + the generic primitive). Expect new
+  findings (filesystem layout, FS persistence, missing niceties) — that's the point.
+- The thin edge router (site → Worker mapping) stays a downstream-integration
+  concern; dev uses ports 8791/8792.
 
-A pragmatic sequencing: adopt (i) now (unblocks everything downstream), schedule (ii)
-as the optimization session, keep (iii) in reserve.
-
-**Then (unchanged order):**
-1. **WP-side shims** — db.php drop-in targeting pdo_d1 + Requests transport on
-   fp_async_call. All runtime surfaces now exist (pdo_d1 + the full extension floor).
+**Scheduled / unchanged:**
+1. **JSPI port** — required, not optional, if the floor grows (ADR-0024 caveat);
+   also the lever for the 38.5 MiB-raw cold-start concern.
 2. **pdo_d1 Phase 2** — transactions strategy, attributes, production-D1 meta
-   re-verification.
-3. **WordPress bootstrap** — now genuinely unblocked: DB path + extension floor done.
-4. R2/DO consumers; PHP patch-version bump.
+   re-verification (RESULTS 11.5 list).
+3. R2/DO consumers; PHP patch-version bump; UPSTREAM.md filings (maintainer's call).

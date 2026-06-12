@@ -31,7 +31,9 @@ See `docs/DESIGN.md`.
 1. **Before starting:** read the docs relevant to the task — at minimum
    `docs/HANDOFF.md` (current state + next action) and `docs/DECISIONS.md`
    (binding decisions), plus `docs/DESIGN.md`, `docs/BUILD.md`, or
-   `docs/RESULTS.md` as the task touches them.
+   `docs/RESULTS.md` as the task touches them. When a finding is worth
+   reporting to an upstream project, add an entry to `docs/UPSTREAM.md`
+   (filing itself is the maintainer's call, never a session task).
 2. **Decision changes are recorded, never silent.** Do not contradict an
    accepted decision. If a task (or the prompt driving it) changes a
    previously-documented decision — even a sensible change — **record a new

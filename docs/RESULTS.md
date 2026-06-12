@@ -1172,6 +1172,27 @@ GOT/trampoline: zero codegen errors in every batch's wrangler log; `vp`-only.
 
 ---
 
+## Session 14 — per-version Worker split: PASS (2026-06-12; no rebuild)
+
+**PASS.** ADR-0024 adopted (i) per-version Workers; the deployment was restructured
+(wrangler environments, one binary per Worker) and verified with the full standing
+suite on both Workers. Config/loader surgery only — binaries unchanged from S13.
+
+- Per-env `main` override verified empirically on wrangler 4.96.0 before committing
+  to environments over two config files (dry-run with `--outdir` bundles the env's
+  own entry).
+- `php84` Worker (port 8791) and `php82` Worker (port 8792), two consecutive
+  requests each: the complete Session 13 demo — pdo_d1 D1 query, fp_async_call
+  interleave, all-13 extension sanity line, all functional probes — identical
+  output to Session 13, with the correct `X-PHP-Version-Served: 8.4` / `8.2`
+  headers. GOT errors: 0 on both.
+- Node V8 (config-only sanity that nothing got unwired): regression + pdo_d1 mock
+  PASS on both versions.
+- `docs/UPSTREAM.md` created and seeded with the three standing upstream findings
+  (mbstring static-mode flags, gd bogus flag, unpinned companion-extension clones).
+
+---
+
 ## Asyncify vs JSPI comparison
 
 *Pending Session 5.* To be recorded:

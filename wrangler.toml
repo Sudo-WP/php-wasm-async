@@ -1,19 +1,50 @@
+# php-wasm-async — per-version Workers (Session 14, ADR-0024).
+# Each environment carries exactly ONE PHP binary (the Session 13 extension
+# floor pushed the two-binary bundle past the 10 MiB gz Paid limit).
+# Dev: wrangler dev --local --env php84 --port 8791
+#      wrangler dev --local --env php82 --port 8792
+# Note: wrangler environments DO support per-env `main` (verified empirically,
+# wrangler 4.96.0); KV/D1 bindings are NOT inherited by named envs and are
+# re-declared per env. The bare (no --env) config serves 8.4 for convenience.
+
 name = "php-wasm-async-poc"
-main = "worker/index.mjs"
+main = "worker/php84.mjs"
 compatibility_date = "2024-09-23"
 
-# KV namespace — Session 6 demo (kept for reference; not the active handler).
-# Seed: wrangler kv key put --binding=KV "greeting" "hello from KV" --local --preview false
 [[kv_namespaces]]
 binding = "KV"
 id = "local-dev-only"
 preview_id = "local-dev-only"
 
-# D1 database — Session 7 demo (active handler).
-# database_id is a placeholder; wrangler dev --local creates the SQLite file
-# automatically in .wrangler/state/d1/. No Cloudflare credentials needed.
-# Seed: see docs/BUILD.md Session 7.
 [[d1_databases]]
+binding = "DB"
+database_name = "php-wasm-async-dev"
+database_id = "local-dev-only"
+
+# ---- PHP 8.4 Worker ----
+[env.php84]
+main = "worker/php84.mjs"
+
+[[env.php84.kv_namespaces]]
+binding = "KV"
+id = "local-dev-only"
+preview_id = "local-dev-only"
+
+[[env.php84.d1_databases]]
+binding = "DB"
+database_name = "php-wasm-async-dev"
+database_id = "local-dev-only"
+
+# ---- PHP 8.2 Worker ----
+[env.php82]
+main = "worker/php82.mjs"
+
+[[env.php82.kv_namespaces]]
+binding = "KV"
+id = "local-dev-only"
+preview_id = "local-dev-only"
+
+[[env.php82.d1_databases]]
 binding = "DB"
 database_name = "php-wasm-async-dev"
 database_id = "local-dev-only"

@@ -791,6 +791,40 @@ first (caused a PHP parse error in this session).
 containing the string (e.g. `apply-workerd-patches.py`) including the calling shell;
 and bound every wait (`timeout 90 bash -c 'until curl …'`) with a log dump on expiry.
 
+### Session 14 — per-version Worker split (validated 2026-06-12; no rebuild)
+
+**Deployment shape (ADR-0024):** one Worker per PHP version, via wrangler
+environments in the single `wrangler.toml`:
+
+- `worker/php84.mjs` / `worker/php82.mjs` — thin entries importing exactly one
+  binary each; shared logic in `worker/run-php.mjs` (`createHandler`).
+- `[env.php84]` / `[env.php82]` each set their own `main` and re-declare KV/D1
+  bindings (named envs do NOT inherit binding tables in wrangler).
+- **Per-env `main` override works** — verified empirically on wrangler 4.96.0
+  (`wrangler deploy --dry-run --env X --outdir` bundles the env's own entry).
+  This is why environments were chosen over two config files.
+- Version selection is now a deploy-time property; `X-PHP-Version-Served` is
+  still emitted per Worker for external verification. The thin edge router that
+  picks a site's Worker is downstream integration, not part of this repo.
+
+**Dev workflow:**
+
+```bash
+wrangler dev --local --env php84 --port 8791   # PHP 8.4 Worker
+wrangler dev --local --env php82 --port 8792   # PHP 8.2 Worker
+# bare `wrangler dev --local` serves the 8.4 entry (top-level main) for convenience
+```
+
+Use bounded waits and `pkill -x workerd` per the Session 13 operational notes.
+
+**Superseded (kept as knowledge): the multi-version single-Worker pattern.**
+Sessions 8–13 served both versions from one deployment with per-request
+`X-PHP-Version` header selection (both glue modules + both wasm binaries
+imported statically; see the Session 8 section above). It still works wherever
+the combined bundle fits the limit — it was the Session 13 extension floor
+(15.89 MiB gz combined) that retired it for production-shaped builds, not any
+defect. The pattern lives in git history (`worker/index.mjs` before Session 14).
+
 ## Known fragile steps
 
 - **Exhaustive suspendable-imports list.** *Not a problem on this pipeline*
